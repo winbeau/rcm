@@ -1,4 +1,7 @@
-<h1 align="center"> rCM: Score-Regularized Continuous-Time Consistency Model <br>🚀SOTA JVP-Based Diffusion Distillation & Few-Step Video Generation & Scaling Up sCM/MeanFlow </h1>
+<h1 align="center"> rCM: Score-Regularized Continuous-Time Consistency Model </h1>
+<h1 align="center"> Causal-rCM: Teacher-Forcing meets Self-Forcing in Autoregressive Diffusion Distillation for Streaming Video Generation and Interactive World Models </h1>
+<h3 align="center"> 🚀State-of-the-Art JVP-Based Diffusion Distillation · Few-Step Video Generation · Scaling Up sCM/MeanFlow · Causal/Autoregressive Extension </h3>
+<h3 align="center"> 🚀A Leading, Unified and Scalable Open-Source Algorithm-and-Infrastructure Recipe for Diffusion Distillation and Causal Training </h3>
 <div align="center">
   <div>
   <p align="center" style="font-size: larger;">
@@ -9,12 +12,33 @@
   <a href='https://research.nvidia.com/labs/dir/rcm'><img src='https://img.shields.io/badge/Website-green?logo=homepage&logoColor=white'></a> &nbsp;
 </div>
 
-**Notice**: rCM will soon support ***causal training***, unlocking how **teacher-forcing** (forward-divergence/offline) CM complements **self-forcing** (reverse-divergence/on-policy) DMD in autoregressive video diffusion distillation!
+**Notice**: rCM now includes a ***causal/autoregressive training*** stack, showing how **teacher-forcing** (forward-divergence/offline) CM complements **self-forcing** (reverse-divergence/on-policy) DMD in autoregressive video diffusion distillation.
+
+*Paper coming soon...*
+
+<p align="center">
+<img src="assets/vbench.png" width=95%>
+<p>
 
 <p align="center">
 <img src="assets/causal-teaser.png" width=95%>
   <p align="center">
     Illustration of <b>Causal-rCM</b>.
+  </p>
+<p>
+
+## Causal-rCM / Autoregressive Training
+
+This repository now supports advanced algorithms and infrastructure for autoregressive video diffusion training and distillation. Causal-rCM provides a state-of-the-art causal distillation recipe. See [`Causal_rCM.md`](Causal_rCM.md) for details.
+
+Also included:
+- Optimized causal inference with time benchmarking, quantized KV cache, and bounded-memory length extrapolation.
+- Simplified and reproducible VBench evaluation suite.
+
+<p align="center">
+<img src="assets/infra.png" width=95%>
+  <p align="center">
+    Infrastructure comparison with other codebases.
   </p>
 <p>
 
@@ -55,9 +79,9 @@ conda activate rcm
 conda install cmake ninja
 conda install -c nvidia cuda-nvcc cuda-toolkit
 # depending on your cuda version
-pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu126
+pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu126
 # misc
-pip install megatron-core hydra-core loguru attrs fvcore nvidia-ml-py imageio[ffmpeg] pandas wandb psutil ftfy regex transformers webdataset
+pip install megatron-core hydra-core loguru attrs fvcore nvidia-ml-py imageio[ffmpeg] pandas wandb psutil ftfy regex transformers webdataset safetensors
 # transformer_engine
 pip install --no-build-isolation transformer_engine[pytorch]
 # flash_attn
@@ -103,24 +127,30 @@ PYTHONPATH=.  python rcm/inference/wan2pt1_t2v_rcm_infer.py \
 
 See [Wan examples](Wan.md) for additional usage and I2V examples.
 
+For Causal-rCM inference, I2V, quantized KV cache, length extrapolation, and training recipes, see [`Causal_rCM.md`](Causal_rCM.md).
+
 ## Training
 In this repo, we provide training code based on Wan2.1 and its synthetic data.
 
-Advanced training infrastructure supported:
+Advanced training infrastructure:
 - **FSDP2**. Adjust by setting `model.config.fsdp_shard_size`.
 - **Ulysses Context Parallel (CP)**. Adjust by setting `model_parallel.context_parallel_size`. Ulysses CP requires that the CP size is a factor of `num_heads` (12 for Wan2.1 1.3B, 40 for Wan2.1 14B). When enabling CP, ensure that the number of GPUs is divisible by the chosen CP size. The effective batch size is reduced by a factor of the CP size. 
 - **Selective Activation Checkpointing (SAC)**. Adjust by setting `model.config.net.sac_config.mode`.
 - **Gradient Accumulation**. Adjust by setting `trainer.grad_accum_iter`.
 
-Other distillation baselines (dCM, sCM, DMD):
-- **Pure DMD distillation (JVP-free)** by disabling the sCM loss (setting `model.config.loss_scale=0`), and optionally fixing the backward simulation timesteps to predetermined values (setting `model.config.dmd_fix_timesteps=True`).
+Distillation baselines (dCM, sCM, DMD):
+- **Discrete-time CM (JVP-free)** by setting `model.config.cm_type=dcm` and optionally disabling the DMD loss (setting `model.config.net_fake_score=null` or `model.config.loss_scale_dmd=0`).
 - **Pure sCM distillation (JVP-based)** by setting `model.config.net_fake_score=null` or `model.config.loss_scale_dmd=0`.
-- **Discrete-time CM (JVP-free)** by setting `model.config.cm_type=dcm`.
+- **Pure DMD distillation (JVP-free)** by disabling the CM loss (setting `model.config.loss_scale=0`), and optionally fixing the backward simulation timesteps to predetermined values (setting `model.config.dmd_fix_timesteps=True`, recommended).
+
+**Note**: sCM + DMD joint training may be unstable for some models. We recommend **a most robust way of applying rCM: splitting the distillation process into separate stages (dCM (warmup) -> sCM -> DMD (+sCM))**.
 
 #### Key Components
 - FlashAttention-2 JVP kernel: `rcm/utils/flash_attention_jvp_triton.py`
 - JVP-adapted Wan2.1 student network: `rcm/networks/wan2pt1_jvp.py`
 - Training loop: `rcm/models/t2v_model_distill_rcm.py`
+- Causal training/distillation loop: `rcm/models/t2v_model_causal.py`
+- Causal attention and KV-cache infrastructure: `rcm/utils/blockmask.py`, `rcm/utils/kv_cache.py`
 
 #### Checkpoints Downloading
 Download the Wan2.1 teacher checkpoints in `.pth` format and VAE/text encoder to `assets/checkpoints`:
@@ -129,6 +159,8 @@ Download the Wan2.1 teacher checkpoints in `.pth` format and VAE/text encoder to
 # make sure git lfs is installed
 git clone https://huggingface.co/worstcoder/Wan assets/checkpoints
 ```
+
+rCM and Causal-rCM checkpoints can be placed in the same `assets/checkpoints` directory. See [`Causal_rCM.md`](Causal_rCM.md) for causal checkpoint naming and per-step inference commands.
 
 Our code is based on FSDP2 and relies on [Distributed Checkpoint (DCP)](https://docs.pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html) for loading and saving checkpoints. Before training, convert `.pth` teacher checkpoints to `.dcp` first:
 
@@ -178,10 +210,12 @@ torchrun --nproc_per_node=8 \
 
 Please refer to `rcm/configs/experiments/rcm/wan2pt1_t2v.py` for the 14B config or perform modifications as needed.
 
+For causal training, see `rcm/configs/experiments/causal_rcm/wan2pt1_t2v.py` and [`Causal_rCM.md`](Causal_rCM.md).
+
 ## Future Directions
 
 There are promising directions to explore based on rCM. For example:
-- The forward–reverse divergence joint distillation framework of rCM could be extended to **autoregressive video diffusion** by leveraging a *causal teacher with teacher forcing* to complement self-forcing. 
+- The Causal-rCM framework can be further scaled to longer-horizon interactive world models and richer streaming-generation settings.
 - Few-step distilled models lag behind the teacher in aspects such as physical consistency; this can potentially be improved via reinforcement learning.
 
 ## Acknowledgement

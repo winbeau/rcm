@@ -72,3 +72,15 @@ def register_net_teacher():
     cs = ConfigStore.instance()
     cs.store(group="net_teacher", package="model.config.net_teacher", name="wan2pt1_1pt3B_t2v", node=WAN2PT1_1PT3B_T2V)
     cs.store(group="net_teacher", package="model.config.net_teacher", name="wan2pt1_14B_t2v", node=WAN2PT1_14B_T2V)
+
+
+def register_net_causal_teacher():
+    cs = ConfigStore.instance()
+    cs.store(group="net_causal_teacher", package="model.config.net_causal_teacher", name="wan2pt1_1pt3B_t2v", node=WAN2PT1_1PT3B_T2V)
+    cs.store(group="net_causal_teacher", package="model.config.net_causal_teacher", name="wan2pt1_14B_t2v", node=WAN2PT1_14B_T2V)
+
+
+def register_net_bidirectional_teacher():
+    cs = ConfigStore.instance()
+    cs.store(group="net_bidirectional_teacher", package="model.config.net_bidirectional_teacher", name="wan2pt1_1pt3B_t2v", node=WAN2PT1_1PT3B_T2V)
+    cs.store(group="net_bidirectional_teacher", package="model.config.net_bidirectional_teacher", name="wan2pt1_14B_t2v", node=WAN2PT1_14B_T2V)

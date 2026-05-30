@@ -23,6 +23,8 @@ from imaginaire.lazy_config import instantiate
 from rcm.networks.wan2pt1 import WanModel
 from rcm.networks.wan2pt1_jvp import CheckpointMode, SACConfig, WanModel_JVP
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Wan JVP tests")
+
 """
 Usage:
     pytest -s rcm/networks/wan2pt1_jvp_test.py

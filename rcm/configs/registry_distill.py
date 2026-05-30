@@ -30,13 +30,19 @@ from rcm.configs.defaults.ckpt_type import register_ckpt_type
 from rcm.configs.defaults.dataloader import register_dataloader
 from rcm.configs.defaults.tokenizer import register_tokenizer
 from rcm.configs.defaults.model import register_model
-from rcm.configs.defaults.net import register_net, register_net_fake_score, register_net_teacher
+from rcm.configs.defaults.net import (
+    register_net,
+    register_net_bidirectional_teacher,
+    register_net_causal_teacher,
+    register_net_fake_score,
+    register_net_teacher,
+)
 
 
 @attrs.define(slots=False)
 class Config(config.Config):
     # default config groups that will be used unless overwritten
-    # see config groups in registry.py
+    # see config groups registered below and in rcm/configs/defaults/
     defaults: List[Any] = attrs.field(
         factory=lambda: [
             "_self_",
@@ -51,6 +57,8 @@ class Config(config.Config):
             {"model": "fsdp_t2v_distill_rcm"},
             {"net": None},
             {"net_teacher": None},
+            {"net_causal_teacher": None},
+            {"net_bidirectional_teacher": None},
             {"net_fake_score": None},
             {"optimizer_fake_score": "fusedadamw"},
             {"conditioner": "text_nodrop"},
@@ -72,7 +80,7 @@ def make_config() -> Config:
     )
 
     # Specifying values through instances of attrs
-    c.job.project = "rcm"  # this decides the wandb project name
+    c.job.project = "rCM"  # this decides the wandb project name
     c.job.group = "debug"
     c.job.name = "delete_${now:%Y-%m-%d}_${now:%H-%M-%S}"
 
@@ -94,6 +102,8 @@ def make_config() -> Config:
     register_model()
     register_net()
     register_net_teacher()
+    register_net_causal_teacher()
+    register_net_bidirectional_teacher()
     register_net_fake_score()
     register_conditioner()
     register_ema()
@@ -101,4 +111,5 @@ def make_config() -> Config:
 
     # experiment config are defined in the experiments folder
     import_all_modules_from_package("rcm.configs.experiments.rcm", reload=True)
+    import_all_modules_from_package("rcm.configs.experiments.causal_rcm", reload=True)
     return c

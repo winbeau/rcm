@@ -44,31 +44,18 @@ Citation:
 }
 """
 
+from importlib.metadata import version as pkg_version
+from packaging.version import parse as vparse
 import torch
 import triton
 import triton.language as tl
 from einops import rearrange
 from flash_attn.flash_attn_interface import _flash_attn_backward, _flash_attn_varlen_backward
-
-import inspect
-
-
-def _get_param_names(fn):
-    # Works for normal Python functions; for some C++/pybind builtins,
-    # inspect.signature might fail, then we fall back to __text_signature__.
-    try:
-        return set(inspect.signature(fn).parameters.keys())
-    except Exception:
-        ts = getattr(fn, "__text_signature__", "") or ""
-        # crude but usually good enough
-        for ch in "(),*:":  # strip common punctuation
-            ts = ts.replace(ch, " ")
-        return set(ts.split())
+from rcm.utils.magimask import MagiMask, make_magi_ranges_full, prepare_magi_csr_and_tasks
+from rcm.utils.blockmask import BlockPattern, AttnMaskSpec
 
 
 def _make_flash_bwd_caller(flash_bwd_fn):
-    params = _get_param_names(flash_bwd_fn)
-
     def call(
         *pos_args,
         dropout_p=0.0,
@@ -80,13 +67,13 @@ def _make_flash_bwd_caller(flash_bwd_fn):
         deterministic=False,
         **extra_kwargs,
     ):
+        assert vparse(pkg_version("flash-attn")) >= vparse("2.7.0.post1")
         ws_left, ws_right = window_size
 
         kw = dict(
             dropout_p=dropout_p,
             softmax_scale=softmax_scale,
             causal=causal,
-            window_size=window_size,
             window_size_left=ws_left,
             window_size_right=ws_right,
             softcap=softcap,
@@ -94,8 +81,6 @@ def _make_flash_bwd_caller(flash_bwd_fn):
             deterministic=deterministic,
         )
         kw.update(extra_kwargs)
-
-        kw = {k: v for k, v in kw.items() if k in params}
 
         return flash_bwd_fn(*pos_args, **kw)
 
@@ -110,7 +95,7 @@ DEVICE = "cuda"
 configs = [
     triton.Config({"BLOCK_M": BM, "BLOCK_N": BN}, num_stages=s, num_warps=w)
     for BM in [64, 128]
-    for BN in [16, 32, 64]
+    for BN in [16, 32, 64, 128]
     for s in [3, 4, 7]
     for w in [4, 8]
 ]
@@ -244,6 +229,183 @@ def _attn_fwd(
     tl.store(LSE_ptrs, lse, mask=m_mask)
 
 
+_magi_configs = [
+    triton.Config({"BLOCK_N": BN}, num_stages=s, num_warps=w)
+    for BN in [16, 32, 64, 128]
+    for s in [3, 4, 7]
+    for w in [4, 8]
+]
+
+@triton.autotune(_magi_configs, key=["SEQ_LEN_Q", "SEQ_LEN_KV", "HEAD_DIM_QK", "HEAD_DIM_V", "BLOCK_M"])
+@triton.jit
+def _attn_fwd_magi(
+    Q, K, V,
+    tQ, tK, tV,
+    sm_scale,                 # fp32 scalar
+    LSE,                      # [B, H, SEQ_LEN_Q] fp32 (natural log)
+    O, tO,                    # [B, H, SEQ_LEN_Q, HEAD_DIM_V]
+
+    stride_qb, stride_qh, stride_qm, stride_qd,
+    stride_kb, stride_kh, stride_kn, stride_kd,
+    stride_vb, stride_vh, stride_vn, stride_vd,
+    stride_ob, stride_oh, stride_om, stride_od,
+
+    # Magi slice CSR
+    q_unique_ptr,             # [G,2] int32
+    k_ranges_ptr,             # [K,2] int32
+    qk_map_ptr,               # [G+1] int32
+
+    # tasks
+    task_group_ptr,           # [T] int32
+    task_qtile_ptr,           # [T] int32
+
+    B: tl.constexpr, H: tl.constexpr,
+    SEQ_LEN_Q: tl.constexpr, SEQ_LEN_KV: tl.constexpr,
+    HEAD_DIM_QK: tl.constexpr, HEAD_DIM_V: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_task = tl.program_id(0).to(tl.int64)
+    pid_bh = tl.program_id(1).to(tl.int64)
+
+    off_b = pid_bh // H
+    off_h = pid_bh % H
+
+    # task payload
+    g = tl.load(task_group_ptr + pid_task).to(tl.int32)
+    qtile = tl.load(task_qtile_ptr + pid_task).to(tl.int32)
+
+    # q range [q0,q1)
+    q0 = tl.load(q_unique_ptr + g.to(tl.int64) * 2 + 0).to(tl.int32)
+    q1 = tl.load(q_unique_ptr + g.to(tl.int64) * 2 + 1).to(tl.int32)
+
+    offs_m  = qtile.to(tl.int32) * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int32)   # token ids
+    offs_n  = tl.arange(0, BLOCK_N).to(tl.int32)
+    offs_dq = tl.arange(0, HEAD_DIM_QK)
+    offs_dv = tl.arange(0, HEAD_DIM_V)
+
+    # q mask: within real Q and within this slice q-range
+    m_in_q = offs_m < SEQ_LEN_Q
+    m_in_slice = (offs_m >= q0) & (offs_m < q1)
+    m_mask = m_in_q & m_in_slice
+
+    # base pointers for this (b, h)
+    q_base = off_b * stride_qb + off_h * stride_qh
+    k_base = off_b * stride_kb + off_h * stride_kh
+    v_base = off_b * stride_vb + off_h * stride_vh
+    o_base = off_b * stride_ob + off_h * stride_oh
+
+    # load Q / tQ
+    Q_ptrs  = Q  + q_base + offs_m[:, None].to(tl.int64) * stride_qm + offs_dq[None, :].to(tl.int64) * stride_qd
+    tQ_ptrs = tQ + q_base + offs_m[:, None].to(tl.int64) * stride_qm + offs_dq[None, :].to(tl.int64) * stride_qd
+    q  = tl.load(Q_ptrs,  mask=m_mask[:, None], other=0.0)
+    tq = tl.load(tQ_ptrs, mask=m_mask[:, None], other=0.0)
+
+    # streaming softmax stats (log2 domain)
+    m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+
+    # JVP accumulators (unnormalized, in the same exp2(logit-m_i) basis)
+    o_i = tl.zeros([BLOCK_M, HEAD_DIM_V], dtype=tl.float32)
+    A_i = tl.zeros([BLOCK_M, HEAD_DIM_V], dtype=tl.float32)
+    B_i = tl.zeros([BLOCK_M, HEAD_DIM_V], dtype=tl.float32)
+    r_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+
+    qk_scale_log2 = sm_scale * 1.4426950408889634  # *= 1/ln(2)
+
+    # interval list for group g
+    beg = tl.load(qk_map_ptr + g.to(tl.int64)).to(tl.int32)
+    end = tl.load(qk_map_ptr + g.to(tl.int64) + 1).to(tl.int32)
+    nint = end - beg
+
+    i = tl.zeros([], dtype=tl.int32)
+    while i < nint:
+        # [k0,k1)
+        k0 = tl.load(k_ranges_ptr + (beg + i).to(tl.int64) * 2 + 0).to(tl.int32)
+        k1 = tl.load(k_ranges_ptr + (beg + i).to(tl.int64) * 2 + 1).to(tl.int32)
+        k0 = tl.maximum(k0, 0)
+        k1 = tl.minimum(k1, SEQ_LEN_KV)
+
+        # align start to BLOCK_N to help scheduling; mask out <k0
+        start_n = (k0 // BLOCK_N) * BLOCK_N
+
+        while start_n < k1:
+            start_n = tl.multiple_of(start_n, BLOCK_N)
+            n_idx = start_n + offs_n
+            n_mask = (n_idx >= k0) & (n_idx < k1) & (n_idx < SEQ_LEN_KV)
+
+            # K / tK: [Dq, BN]
+            K_ptrs  = K  + k_base + n_idx[None, :].to(tl.int64) * stride_kn + offs_dq[:, None].to(tl.int64) * stride_kd
+            tK_ptrs = tK + k_base + n_idx[None, :].to(tl.int64) * stride_kn + offs_dq[:, None].to(tl.int64) * stride_kd
+            k  = tl.load(K_ptrs,  mask=n_mask[None, :], other=0.0)
+            tk = tl.load(tK_ptrs, mask=n_mask[None, :], other=0.0)
+
+            # qk in log2 domain
+            qk = tl.dot(q, k).to(tl.float32) * qk_scale_log2
+            # masked rows (outside slice) must contribute nothing
+            qk = tl.where(m_mask[:, None], qk, -float("inf"))
+            qk = tl.where(n_mask[None, :], qk, -float("inf"))
+
+            # flash2 streaming update
+            row_max = tl.max(qk, axis=1)
+            m_ij = tl.maximum(m_i, row_max)
+            m_ij_safe = tl.where(m_ij == -float("inf"), 0.0, m_ij)
+
+            p = tl.math.exp2(qk - m_ij_safe[:, None])  # unnormalized P~
+            l_ij = tl.sum(p, axis=1)
+            alpha = tl.math.exp2(m_i - m_ij_safe)
+
+            l_i = l_i * alpha + l_ij
+            o_i = o_i * alpha[:, None]
+            A_i = A_i * alpha[:, None]
+            B_i = B_i * alpha[:, None]
+            r_i = r_i * alpha
+            m_i = m_ij
+
+            # V / tV: [BN, Dv]
+            V_ptrs  = V  + v_base + n_idx[:, None].to(tl.int64) * stride_vn + offs_dv[None, :].to(tl.int64) * stride_vd
+            tV_ptrs = tV + v_base + n_idx[:, None].to(tl.int64) * stride_vn + offs_dv[None, :].to(tl.int64) * stride_vd
+            v  = tl.load(V_ptrs,  mask=n_mask[:, None], other=0.0)
+            tv = tl.load(tV_ptrs, mask=n_mask[:, None], other=0.0)
+
+            # tS (natural domain)
+            tS = (tl.dot(tq, k).to(tl.float32) + tl.dot(q, tk).to(tl.float32)) * sm_scale
+            tS = tl.where(m_mask[:, None] & n_mask[None, :], tS, 0.0)
+
+            Htilde = p * tS
+            r_i += tl.sum(Htilde, axis=1)
+
+            p_f = p.to(v.dtype)
+            H_f = Htilde.to(v.dtype)
+            o_i = tl.dot(p_f, v, o_i)
+            A_i = tl.dot(p_f, tv, A_i)
+            B_i = tl.dot(H_f, v, B_i)
+
+            start_n += BLOCK_N
+
+        i += 1
+
+    # epilogue (only store masked rows)
+    l_i_safe = tl.where(l_i == 0.0, 1.0, l_i)
+    inv_l = 1.0 / l_i_safe
+
+    O_i  = o_i * inv_l[:, None]
+    A_n  = A_i * inv_l[:, None]
+    B_n  = B_i * inv_l[:, None]
+    mu   = r_i * inv_l
+    tO_i = A_n + B_n - mu[:, None] * O_i
+
+    lse = (m_i + tl.math.log2(l_i_safe)) * 0.6931471805599453  # ln2
+
+    O_ptrs   = O  + o_base + offs_m[:, None].to(tl.int64) * stride_om + offs_dv[None, :].to(tl.int64) * stride_od
+    tO_ptrs  = tO + o_base + offs_m[:, None].to(tl.int64) * stride_om + offs_dv[None, :].to(tl.int64) * stride_od
+    LSE_ptrs = LSE + (off_b * H + off_h).to(tl.int64) * SEQ_LEN_Q + offs_m.to(tl.int64)
+
+    tl.store(O_ptrs,  O_i.to(O.type.element_ty),   mask=m_mask[:, None])
+    tl.store(tO_ptrs, tO_i.to(tO.type.element_ty), mask=m_mask[:, None])
+    tl.store(LSE_ptrs, lse, mask=m_mask)
+
+
 def generate_qkv(q, k, v):
     """
     Arguments:
@@ -295,7 +457,7 @@ class _attention(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, q, k, v, tq, tk, tv, sm_scale=None):
+    def forward(ctx, q, k, v, tq, tk, tv, sm_scale=None, magi_mask: MagiMask = None):
         is_grad = any(x.requires_grad for x in [q, k, v])
         # shape constraints
         assert q.shape[:-2] == k.shape[:-2] and k.shape[:-2] == v.shape[:-2]
@@ -314,27 +476,56 @@ class _attention(torch.autograd.Function):
 
         M = torch.empty((B, H, SEQ_LEN_Q), device=q.device, dtype=torch.float32)
 
-        def grid(args):
-            return (triton.cdiv(SEQ_LEN_Q, args["BLOCK_M"]), B * H, 1)
+        if magi_mask is None:
+            def grid(args):
+                return (triton.cdiv(SEQ_LEN_Q, args["BLOCK_M"]), B * H, 1)
+            
+            _attn_fwd[grid](
+                q, k, v,
+                tq, tk, tv,
+                sm_scale,
+                M,
+                o, to,
+                q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+                k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+                v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+                o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+                B, H,
+                SEQ_LEN_Q, SEQ_LEN_KV,
+                HEAD_DIM_QK, HEAD_DIM_V,
+            )
+            if is_grad:
+                ctx.save_for_backward(q, k, v, o, M)
+                ctx.sm_scale = sm_scale
+        else:
+            if is_grad:
+                raise RuntimeError("Backward with MagiMask is not supported.")
 
-        _attn_fwd[grid](
-            q, k, v,
-            tq, tk, tv,
-            sm_scale,
-            M,
-            o, to,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-            B, H,
-            SEQ_LEN_Q, SEQ_LEN_KV,
-            HEAD_DIM_QK, HEAD_DIM_V,
-        )
+            def grid(meta):
+                return (magi_mask.T, B * H, 1)
 
-        if is_grad:
-            ctx.save_for_backward(q, k, v, o, M)
-            ctx.sm_scale = sm_scale
+            _attn_fwd_magi[grid](
+                q, k, v,
+                tq, tk, tv,
+                sm_scale,
+                M,
+                o, to,
+                q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+                k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+                v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+                o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+
+                magi_mask.q_unique,
+                magi_mask.k_flat,
+                magi_mask.qk_map,
+                magi_mask.task_group,
+                magi_mask.task_qtile,
+
+                B=B, H=H,
+                SEQ_LEN_Q=SEQ_LEN_Q, SEQ_LEN_KV=SEQ_LEN_KV,
+                HEAD_DIM_QK=HEAD_DIM_QK, HEAD_DIM_V=HEAD_DIM_V,
+                BLOCK_M=magi_mask.BLOCK_M,
+            )
         return o, to
 
     @staticmethod
@@ -382,7 +573,7 @@ class _attention(torch.autograd.Function):
                 causal=False,
             )
             dq, dk, dv = pad_fn(dq), pad_fn(dk), pad_fn(dv)
-        return dq, dk, dv, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None
 
 
 attention = _attention.apply
@@ -609,6 +800,133 @@ def test_jvp_ca():
             print(f"Shape={shape}, Dtype={dtype} Passed (CA fwd/JVP with different headdim).")
 
 
+def _build_bool_mask_from_spec(spec: AttnMaskSpec, Q: int, KV: int, device):
+    """Build a [Q, KV] boolean mask from an AttnMaskSpec for reference testing."""
+    q_idx = torch.arange(Q, device=device)
+    kv_idx = torch.arange(KV, device=device)
+    pat = spec.pattern
+
+    if spec.mode == "block_causal":
+        q_bo = spec.q_block_offset
+        use_first_q = q_bo == 0
+        local_k = spec.local_attn_blocks - 1
+        sink_k = spec.sink_blocks
+
+        q_blk = q_bo + pat.token_to_rel_block(q_idx, use_first_block=use_first_q)
+        kv_blk = pat.token_to_rel_block(kv_idx, use_first_block=True)
+
+        allow = kv_blk[None, :] <= q_blk[:, None]
+        if local_k >= 0:
+            allow = allow & (kv_blk[None, :] >= (q_blk[:, None] - local_k))
+        if sink_k > 0:
+            allow = allow | ((kv_blk[None, :] < sink_k) & (kv_blk[None, :] <= q_blk[:, None]))
+        return allow
+
+    if spec.mode == "teacher_forcing":
+        clean_blocks = spec.clean_blocks
+        local_k = spec.local_attn_blocks - 1
+        sink_k = spec.sink_blocks
+        clean_len = pat.blocks_to_tokens(clean_blocks)
+
+        q_in_clean = q_idx < clean_len
+        kv_in_clean = kv_idx < clean_len
+
+        q_blk_clean = pat.token_to_rel_block(q_idx, use_first_block=True)
+        q_blk_noisy = pat.token_to_rel_block(torch.clamp(q_idx - clean_len, min=0), use_first_block=True)
+        kv_blk_clean = pat.token_to_rel_block(kv_idx, use_first_block=True)
+        kv_blk_noisy = pat.token_to_rel_block(torch.clamp(kv_idx - clean_len, min=0), use_first_block=True)
+
+        # clean queries
+        clean_allow = (q_in_clean[:, None] & kv_in_clean[None, :] &
+                       (kv_blk_clean[None, :] <= q_blk_clean[:, None]))
+        if local_k >= 0:
+            clean_allow = clean_allow & (kv_blk_clean[None, :] >= (q_blk_clean[:, None] - local_k))
+
+        # noisy queries -> previous clean blocks
+        noisy_to_clean = (~q_in_clean[:, None]) & kv_in_clean[None, :] & (kv_blk_clean[None, :] < q_blk_noisy[:, None])
+        if local_k >= 0:
+            noisy_to_clean = noisy_to_clean & (kv_blk_clean[None, :] >= (q_blk_noisy[:, None] - local_k))
+
+        # noisy queries -> same noisy block
+        noisy_to_noisy = (~q_in_clean[:, None]) & (~kv_in_clean[None, :]) & (kv_blk_noisy[None, :] == q_blk_noisy[:, None])
+
+        noisy_allow = noisy_to_clean | noisy_to_noisy
+
+        # sink
+        if sink_k > 0:
+            noisy_allow = noisy_allow | ((~q_in_clean[:, None]) & kv_in_clean[None, :] &
+                                          (kv_blk_clean[None, :] < sink_k) & (kv_blk_clean[None, :] < q_blk_noisy[:, None]))
+            clean_allow = clean_allow | (q_in_clean[:, None] & kv_in_clean[None, :] &
+                                          (kv_blk_clean[None, :] < sink_k) & (kv_blk_clean[None, :] < q_blk_clean[:, None]))
+
+        eye = torch.eye(Q, KV, device=device, dtype=torch.bool)
+        return eye | clean_allow | noisy_allow
+
+    raise ValueError(f"Unknown mode: {spec.mode}")
+
+
+def _test_jvp_magi(B, H, frame_tokens, num_blocks, HEAD_DIM_QK, HEAD_DIM_V, mode,
+                   local_attn_blocks=0, sink_blocks=0, dtype=torch.float16):
+    torch.manual_seed(42)
+    pat = BlockPattern(frame_tokens=frame_tokens, first_chunk_frames=1, chunk_frames=1)
+
+    if mode == "block_causal":
+        Q = pat.blocks_to_tokens(num_blocks)
+        KV = Q
+        spec = AttnMaskSpec(mode="block_causal", pattern=pat, q_block_offset=0,
+                            local_attn_blocks=local_attn_blocks, sink_blocks=sink_blocks)
+    else:
+        clean_len = pat.blocks_to_tokens(num_blocks)
+        Q = KV = 2 * clean_len
+        spec = AttnMaskSpec(mode="teacher_forcing", pattern=pat, clean_blocks=num_blocks,
+                            local_attn_blocks=local_attn_blocks, sink_blocks=sink_blocks)
+
+    BLOCK_M = 64
+    q = torch.empty((B, H, Q, HEAD_DIM_QK), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5)
+    k = torch.empty((B, H, KV, HEAD_DIM_QK), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5)
+    v = torch.empty((B, H, KV, HEAD_DIM_V), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5)
+    tq = torch.empty_like(q).normal_(mean=0.0, std=0.5)
+    tk = torch.empty_like(k).normal_(mean=0.0, std=0.5)
+    tv = torch.empty_like(v).normal_(mean=0.0, std=0.5)
+    sm_scale = HEAD_DIM_QK ** (-0.5)
+
+    q_ranges, k_ranges = make_magi_ranges_full(spec, Q_real=Q, KV_real=KV, device=q.device)
+    magi_mask = prepare_magi_csr_and_tasks(q_ranges, k_ranges, Q_real=Q, KV_real=KV, BLOCK_M=BLOCK_M)
+
+    bool_mask = _build_bool_mask_from_spec(spec, Q, KV, device=q.device)
+
+    def naive_masked_attention(q, k, v):
+        scores = torch.matmul(q, k.transpose(2, 3)) * sm_scale
+        scores = scores.masked_fill(~bool_mask[None, None, :, :], float("-inf"))
+        p = torch.softmax(scores.float(), dim=-1).to(dtype)
+        return torch.matmul(p, v)
+
+    ref_out, ref_tout = torch.func.jvp(naive_masked_attention, (q, k, v), (tq, tk, tv))
+
+    tri_out, tri_tout = attention(q, k, v, tq, tk, tv, sm_scale, magi_mask)
+
+    atol = 2e-2 if dtype == torch.bfloat16 else 1e-2
+    torch.testing.assert_close(ref_out, tri_out, atol=atol, rtol=1e-2)
+    torch.testing.assert_close(ref_tout, tri_tout, atol=atol, rtol=1e-2)
+
+
+def test_jvp_magi():
+    for mode in ["block_causal", "teacher_forcing"]:
+        for shape in [
+            (1, 2, 16, 4, 64, 64),
+            (1, 2, 32, 3, 64, 64),
+            (1, 2, 8, 5, 64, 128),
+        ]:
+            for dtype in [torch.float16, torch.bfloat16]:
+                B, H, ft, nb, dqk, dv = shape
+                _test_jvp_magi(B, H, ft, nb, dqk, dv, mode, dtype=dtype)
+                print(f"Shape={shape}, Mode={mode}, Dtype={dtype} Passed (Magi JVP).")
+    for mode in ["block_causal", "teacher_forcing"]:
+        for dtype in [torch.float16, torch.bfloat16]:
+            _test_jvp_magi(1, 2, 16, 6, 64, 64, mode, local_attn_blocks=3, sink_blocks=1, dtype=dtype)
+            print(f"Mode={mode}, Dtype={dtype}, local_attn=3, sink=1 Passed (Magi JVP sliding window).")
+
+
 if __name__ == "__main__":
     test_fwd_bwd()
     test_jvp()
@@ -616,3 +934,4 @@ if __name__ == "__main__":
     bench_flash_attention.run(save_path=".", print_data=True)
     test_fwd_bwd_ca()
     test_jvp_ca()
+    test_jvp_magi()

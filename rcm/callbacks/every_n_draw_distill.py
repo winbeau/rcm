@@ -113,7 +113,6 @@ class EveryNDrawSample_Distill(EveryN):
         is_image: bool = False,
         num_samples: int = 10,
         sample_fix: bool = True,
-        midt_for_2step: float = 1.3,
         run_at_start: bool = False,
     ):
         super().__init__(every_n, step_size, run_at_start=run_at_start)
@@ -128,7 +127,6 @@ class EveryNDrawSample_Distill(EveryN):
         self.is_image = is_image
         self.num_samples = num_samples
         self.sample_fix = sample_fix
-        self.midt_for_2step = midt_for_2step
 
     def on_train_start(self, model: ImaginaireModel, iteration: int = 0) -> None:
         config_job = self.config.job
@@ -181,12 +179,12 @@ class EveryNDrawSample_Distill(EveryN):
             # we only use rank0 and rank to generate images and save
             # other rank run forward pass to make sure it works for FSDP
             log.debug("entering, fsdp", rank0_only=False)
+            log.debug("entering, sample", rank0_only=False)
             if self.is_sample:
-                log.debug("entering, sample", rank0_only=False)
                 sample_img_fp, MSE = self.sample(trainer, model, data_batch, output_batch, loss, iteration)
-                if self.sample_fix:
-                    self.sample_fixed(trainer, model, data_batch, output_batch, loss, iteration)
-                log.debug("done, sample", rank0_only=False)
+            if self.sample_fix:
+                self.sample_fixed(trainer, model, data_batch, output_batch, loss, iteration)
+            log.debug("done, sample", rank0_only=False)
 
             log.debug("waiting for all ranks to finish", rank0_only=False)
             dist.barrier()
@@ -211,36 +209,22 @@ class EveryNDrawSample_Distill(EveryN):
 
         tag = "ema" if self.is_ema else "reg"
         raw_data, x0, _, _ = model.get_data_and_condition(data_batch)
+        if x0.dim() == 6:
+            x0 = x0[:, 0]
 
         to_show = []
-        sample_1 = model.generate_samples_from_batch(
-            data_batch,
-            # make sure no mismatch and also works for cp
-            state_shape=x0.shape[1:],
-            n_sample=x0.shape[0],
-            mid_t=[],
-        )
+        sample_1 = model.generate_samples_from_batch(data_batch, state_shape=x0.shape[1:], n_sample=x0.shape[0], num_steps=1)
         if hasattr(model, "decode"):
             sample_1 = model.decode(sample_1)
         to_show.append(sample_1.cpu())
 
-        sample_2 = model.generate_samples_from_batch(
-            data_batch,
-            # make sure no mismatch and also works for cp
-            state_shape=x0.shape[1:],
-            n_sample=x0.shape[0],
-            mid_t=[self.midt_for_2step],
-        )
+        sample_2 = model.generate_samples_from_batch(data_batch, state_shape=x0.shape[1:], n_sample=x0.shape[0], num_steps=2)
         if hasattr(model, "decode"):
             sample_2 = model.decode(sample_2)
         to_show.append(sample_2.cpu())
 
         sample_teacher = model.generate_samples_from_batch_teacher(
-            data_batch,
-            # make sure no mismatch and also works for cp
-            state_shape=x0.shape[1:],
-            n_sample=x0.shape[0],
-            num_steps=self.num_sampling_step,
+            data_batch, state_shape=x0.shape[1:], n_sample=x0.shape[0], num_steps=self.num_sampling_step
         )
         if hasattr(model, "decode"):
             sample_teacher = model.decode(sample_teacher)
@@ -262,39 +246,67 @@ class EveryNDrawSample_Distill(EveryN):
 
     @misc.timer("EveryNDrawSample: sample_fixed")
     def sample_fixed(self, trainer, model, data_batch, output_batch, loss, iteration):
-        """
-        Args:
-            skip_save: to make sure FSDP can work, we run forward pass on all ranks even though we only save on rank 0 and 1
-        """
-
         tag = "ema" if self.is_ema else "reg"
+        num_frames = 1 if self.is_image else model.tokenizer.get_pixel_num_frames(model.get_num_video_latent_frames())
+
+        data_batch = get_sample_batch(num_frames=num_frames, resolution=model.config.resolution, batch_size=self.num_samples)
+
+        prompts = list(self.kv_prompt_to_emb.items())
+        num_prompts = len(prompts)
+        num_dp = model.data_parallel_size
+        dp_id = self.data_parallel_id
+
+        num_iters = (num_prompts + num_dp - 1) // num_dp
+
+        first_prompt, first_emb = prompts[0]
+        data_batch[model.config.input_caption_key] = [first_prompt] * self.num_samples
+        data_batch["t5_text_embeddings"] = repeat(first_emb.to(**model.tensor_kwargs), "b l d -> (k b) l d", k=self.num_samples)
 
         to_show = []
 
-        data_batch = get_sample_batch(
-            num_frames=(1 if self.is_image else model.tokenizer.get_pixel_num_frames(model.get_num_video_latent_frames())),
-            resolution=model.config.resolution,
-            batch_size=self.num_samples,
-        )
+        for iter_idx in range(num_iters):
+            prompt_idx = dp_id + iter_idx * num_dp
+            is_valid = prompt_idx < num_prompts
 
-        for prompt, text_emb in self.kv_prompt_to_emb.items():
-            log.info(f"Generating with prompt: {prompt}")
-            data_batch[model.config.input_caption_key] = [prompt] * self.num_samples
-            data_batch["t5_text_embeddings"] = repeat(text_emb.to(**model.tensor_kwargs), "b l d -> (k b) l d", k=self.num_samples)
+            if is_valid:
+                prompt, text_emb = prompts[prompt_idx]
+                log.info(f"Generating with prompt (dp_rank={dp_id}): {prompt}")
+                data_batch[model.config.input_caption_key] = [prompt] * self.num_samples
+                data_batch["t5_text_embeddings"] = repeat(text_emb.to(**model.tensor_kwargs), "b l d -> (k b) l d", k=self.num_samples)
 
-            # generate samples
-            sample = model.generate_samples_from_batch(data_batch, seed=1)
+            if hasattr(model.config, "training_type") and model.config.training_type in {"tf", "df"}:
+                sample = model.generate_samples_from_batch_teacher(data_batch, seed=1)
+            else:
+                sample = model.generate_samples_from_batch(data_batch, seed=1)
 
-            if hasattr(model, "decode"):
-                video = model.decode(sample)
+            if is_valid:
+                if hasattr(model, "decode"):
+                    video = model.decode(sample)
+                else:
+                    video = sample
+                to_show.append(video.cpu())
+                del video
+            del sample
 
-            to_show.append(video.cpu())
-            del sample, video
+        my_indices = [dp_id + it * num_dp for it in range(num_iters) if dp_id + it * num_dp < num_prompts]
+        tmp_path = f"{self.local_dir}/_tmp_fixed_dp{dp_id}_iter{iteration}.pt"
+        if to_show and is_tp_cp_pp_rank0():
+            torch.save({"indices": my_indices, "videos": to_show}, tmp_path)
 
-        base_fp_wo_ext = f"0_{tag}_Sample_Iter{iteration:09d}"
+        dist.barrier()
 
-        if is_tp_cp_pp_rank0() and self.data_parallel_id == 0:
-            self.run_save(to_show, self.num_samples, base_fp_wo_ext)
+        if is_tp_cp_pp_rank0() and dp_id == 0:
+            to_show_all = [None] * num_prompts
+            for dp in range(num_dp):
+                p = f"{self.local_dir}/_tmp_fixed_dp{dp}_iter{iteration}.pt"
+                if os.path.exists(p):
+                    data = torch.load(p, weights_only=False)
+                    for idx, video in zip(data["indices"], data["videos"]):
+                        to_show_all[idx] = video
+                    os.remove(p)
+            if all(v is not None for v in to_show_all):
+                base_fp_wo_ext = f"0_{tag}_Sample_Iter{iteration:09d}"
+                self.run_save(to_show_all, self.num_samples, base_fp_wo_ext)
 
     def run_save(self, to_show, batch_size, base_fp_wo_ext) -> Optional[str]:
         to_show = (1.0 + torch.stack(to_show, dim=0).clamp(-1, 1)) / 2.0  # [n, b, c, t, h, w]

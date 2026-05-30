@@ -48,7 +48,7 @@ def launch(config: Config, args: argparse.Namespace) -> None:
 
 
 if __name__ == "__main__":
-    # Usage: torchrun --nproc_per_node=1 -m scripts.train --config=cosmos_predict2/configs/base/config.py -- experiments=predict2_video2world_training_2b_cosmos_nemo_assets
+    # Usage: torchrun --nproc_per_node=8 -m scripts.train --config=rcm/configs/registry_distill.py -- experiment=wan2pt1_1pt3B_res480p_t2v_rCM
 
     # Get the config file from the input arguments.
     parser = argparse.ArgumentParser(description="Training")

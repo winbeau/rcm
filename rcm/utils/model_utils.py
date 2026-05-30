@@ -51,8 +51,7 @@ def init_weights_on_device(device=torch.device("meta"), include_buffers: bool = 
 
     if include_buffers:
         tensor_constructors_to_patch = {
-            torch_function_name: getattr(torch, torch_function_name)
-            for torch_function_name in ["empty", "zeros", "ones", "full"]
+            torch_function_name: getattr(torch, torch_function_name) for torch_function_name in ["empty", "zeros", "ones", "full"]
         }
     else:
         tensor_constructors_to_patch = {}
@@ -97,14 +96,32 @@ def load_state_dict_from_safetensors(file_path, torch_dtype=None):
 
 def load_state_dict_from_bin(file_path, torch_dtype=None):
     backend_args = None
-    state_dict = easy_io.load(
-        file_path, backend_args=backend_args, file_format="pt", map_location="cpu", weights_only=False
-    )
+    state_dict = easy_io.load(file_path, backend_args=backend_args, file_format="pt", map_location="cpu", weights_only=False)
     if torch_dtype is not None:
         for i in state_dict:
             if isinstance(state_dict[i], torch.Tensor):
                 state_dict[i] = state_dict[i].to(torch_dtype)
     return state_dict
+
+
+def load_state_dict_from_dcp(dcp_dir: str) -> dict:
+    from torch.distributed.checkpoint import FileSystemReader
+    from torch.distributed.checkpoint.default_planner import _EmptyStateDictLoadPlanner
+    from torch.distributed.checkpoint.state_dict_loader import _load_state_dict
+
+    sd: dict = {}
+    _load_state_dict(sd, storage_reader=FileSystemReader(dcp_dir), planner=_EmptyStateDictLoadPlanner(), no_dist=True)
+    has_ema = any(k.startswith("net_ema.") for k in sd)
+    out = {}
+    for k, v in sd.items():
+        if has_ema:
+            if k.startswith("net_ema."):
+                new_key = k.replace("net_ema.", "net.")
+                out[new_key] = v.to(torch.bfloat16) if v.is_floating_point() else v
+        else:
+            if k.startswith("net."):
+                out[k] = v.to(torch.bfloat16) if v.is_floating_point() else v
+    return out
 
 
 def search_for_embeddings(state_dict):
@@ -141,9 +158,7 @@ def build_rename_dict(source_state_dict, target_state_dict, split_qkv=False):
                 length = source_state_dict[name].shape[0] // 3
                 rename = []
                 for i in range(3):
-                    rename.append(
-                        search_parameter(source_state_dict[name][i * length : i * length + length], target_state_dict)
-                    )
+                    rename.append(search_parameter(source_state_dict[name][i * length : i * length + length], target_state_dict))
                 if None not in rename:
                     print(f'"{name}": {rename},')
                     for rename_ in rename:

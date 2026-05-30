@@ -20,19 +20,41 @@ import torch
 import torch.amp as amp
 import torch.nn as nn
 from einops import rearrange, repeat
-from flash_attn.layers.rotary import apply_rotary_emb as flash_apply_rotary_emb
 from torch.distributed import ProcessGroup, get_process_group_ranks
 from torch.distributed._composable.fsdp import fully_shard
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl, CheckpointWrapper
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper as ptd_checkpoint_wrapper
 
 from imaginaire.utils import log
 from rcm.utils.a2a_cp import MinimalA2AAttnOp
 from rcm.utils.selective_activation_checkpoint import CheckpointMode, SACConfig
 from rcm.utils.context_parallel import split_inputs_cp, cat_outputs_cp, cat_outputs_cp_with_grad, broadcast
-from rcm.utils.jvp_helper import JVP, MinimalA2AAttnOpWithT, TensorWithT, naive_attention_op, torch_attention_op
+from rcm.utils.jvp_helper import JVP, MinimalA2AAttnOpWithT, FlexOrSdpaLocalAttentionWithT, TensorWithT, naive_attention_op, torch_attention_op
+from rcm.utils.kv_cache import KVCache, AttnContext, CausalInferenceState, KVCacheMode
+from rcm.utils.blockmask import AttnMaskSpec, FlexOrSdpaLocalAttention
+from rcm.utils.rope import RopeCache
 
 T5_CONTEXT_TOKEN_NUMBER = 512
 FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER = 257 * 2
+
+
+def _uses_append_cache(attn_ctx: Optional[AttnContext]) -> bool:
+    return attn_ctx is not None and attn_ctx.mode == KVCacheMode.APPEND and attn_ctx.kv_cache is not None
+
+
+class CacheAwareCheckpointWrapper(CheckpointWrapper):
+    def __init__(self, module: torch.nn.Module, context_fn, preserve_rng_state: bool):
+        super().__init__(
+            module,
+            checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+            context_fn=context_fn,
+            preserve_rng_state=preserve_rng_state,
+        )
+
+    def forward(self, *args, **kwargs):
+        if _uses_append_cache(kwargs.get("attn_ctx")):
+            return self._checkpoint_wrapped_module(*args, **kwargs)
+        return super().forward(*args, **kwargs)
 
 
 class VideoRopePosition3DEmb(nn.Module):
@@ -62,40 +84,65 @@ class VideoRopePosition3DEmb(nn.Module):
         self.w_ntk_factor = w_extrapolation_ratio ** (dim_w / (dim_w - 2))
         self.t_ntk_factor = t_extrapolation_ratio ** (dim_t / (dim_t - 2))
 
-        self._is_initialized = False
+        self.seq = None
+        self.dim_spatial_range = None
+        self.dim_temporal_range = None
 
-    def cache_parameters(self) -> None:
-        if self._is_initialized:
-            return
-
+    def cache_parameters(self, device: torch.device, max_t_needed: int) -> None:
         dim_h = self._dim_h
         dim_t = self._dim_t
 
-        self.seq = torch.arange(max(self.max_h, self.max_w, self.max_t)).float().cuda()
-        self.dim_spatial_range = torch.arange(0, dim_h, 2)[: (dim_h // 2)].float().cuda() / dim_h
-        self.dim_temporal_range = torch.arange(0, dim_t, 2)[: (dim_t // 2)].float().cuda() / dim_t
-        self._is_initialized = True
+        required_len = max(self.max_h, self.max_w, max(self.max_t, max_t_needed))
+        needs_refresh = (
+            self.seq is None
+            or self.seq.device != device
+            or self.seq.numel() < required_len
+            or self.dim_spatial_range is None
+            or self.dim_temporal_range is None
+        )
+        if not needs_refresh:
+            return
+
+        self.seq = torch.arange(required_len, device=device, dtype=torch.float32)
+        self.dim_spatial_range = torch.arange(0, dim_h, 2, device=device, dtype=torch.float32)[: (dim_h // 2)] / dim_h
+        self.dim_temporal_range = torch.arange(0, dim_t, 2, device=device, dtype=torch.float32)[: (dim_t // 2)] / dim_t
 
     def generate_embeddings(
         self,
         B_T_H_W_C: torch.Size,
+        t_start: int = 0,
+        t_indices: Optional[torch.Tensor] = None,
         h_ntk_factor: Optional[float] = None,
         w_ntk_factor: Optional[float] = None,
         t_ntk_factor: Optional[float] = None,
     ):
-        """
-        Generate embeddings for the given input size.
+        B, T, H, W, _ = B_T_H_W_C
+        assert (
+            H <= self.max_h and W <= self.max_w
+        ), f"Input dimensions (H={H}, W={W}) exceed the maximum dimensions (max_h={self.max_h}, max_w={self.max_w})"
+        total_tokens = T * H * W
 
-        Args:
-            B_T_H_W_C (torch.Size): Input tensor size (Batch, Time, Height, Width, Channels).
-            h_ntk_factor (Optional[float], optional): Height NTK factor. If None, uses self.h_ntk_factor.
-            w_ntk_factor (Optional[float], optional): Width NTK factor. If None, uses self.w_ntk_factor.
-            t_ntk_factor (Optional[float], optional): Time NTK factor. If None, uses self.t_ntk_factor.
+        _t_indices_provided = t_indices is not None
+        if t_indices is None:
+            t_indices = torch.arange(t_start, t_start + T, device=self.patch_device(), dtype=torch.long)
+        else:
+            t_indices = t_indices.to(device=self.patch_device(), dtype=torch.long)
 
-        Returns:
-            Not specified in the original code snippet.
-        """
-        self.cache_parameters()
+        if t_indices.ndim != 1:
+            raise ValueError(f"t_indices must be 1D, got {tuple(t_indices.shape)}")
+
+        if t_indices.numel() == T:
+            t_token = torch.repeat_interleave(t_indices, repeats=H * W)
+        elif t_indices.numel() == total_tokens:
+            t_token = t_indices
+        else:
+            raise ValueError(f"t_indices must have {T} or {total_tokens} elements, got {t_indices.numel()}")
+
+        if _t_indices_provided:
+            max_t_needed = int(t_token.max().item()) + 1 if t_token.numel() > 0 else t_start + T
+        else:
+            max_t_needed = t_start + T
+        self.cache_parameters(device=t_token.device, max_t_needed=max_t_needed)
 
         h_ntk_factor = h_ntk_factor if h_ntk_factor is not None else self.h_ntk_factor
         w_ntk_factor = w_ntk_factor if w_ntk_factor is not None else self.w_ntk_factor
@@ -109,29 +156,25 @@ class VideoRopePosition3DEmb(nn.Module):
         w_spatial_freqs = 1.0 / (w_theta**self.dim_spatial_range)
         temporal_freqs = 1.0 / (t_theta**self.dim_temporal_range)
 
-        B, T, H, W, _ = B_T_H_W_C
-        assert (
-            H <= self.max_h and W <= self.max_w
-        ), f"Input dimensions (H={H}, W={W}) exceed the maximum dimensions (max_h={self.max_h}, max_w={self.max_w})"
-        freqs_h = torch.outer(self.seq[:H], h_spatial_freqs)
-        freqs_w = torch.outer(self.seq[:W], w_spatial_freqs)
+        frame_tokens = H * W
+        repeats = total_tokens // frame_tokens
+        h_idx = torch.arange(H, device=t_token.device).repeat_interleave(W).repeat(repeats)
+        w_idx = torch.arange(W, device=t_token.device).repeat(H).repeat(repeats)
 
-        freqs_t = torch.outer(self.seq[:T], temporal_freqs)
+        freqs_t = t_token.to(torch.float32).unsqueeze(-1) * temporal_freqs.unsqueeze(0)
+        freqs_h = h_idx.to(torch.float32).unsqueeze(-1) * h_spatial_freqs.unsqueeze(0)
+        freqs_w = w_idx.to(torch.float32).unsqueeze(-1) * w_spatial_freqs.unsqueeze(0)
 
-        freqs_T_H_W_D = torch.cat(
-            [
-                repeat(freqs_t, "t d -> t h w d", h=H, w=W),
-                repeat(freqs_h, "h d -> t h w d", t=T, w=W),
-                repeat(freqs_w, "w d -> t h w d", t=T, h=H),
-            ],
-            dim=-1,
-        )
-
-        return rearrange(freqs_T_H_W_D, "t h w d -> (t h w) d").float()
+        return torch.cat([freqs_t, freqs_h, freqs_w], dim=-1).float()
 
     @property
     def seq_dim(self):
         return 0
+
+    def patch_device(self) -> torch.device:
+        if self.seq is not None:
+            return self.seq.device
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def sinusoidal_embedding_1d(dim, position):
@@ -144,61 +187,6 @@ def sinusoidal_embedding_1d(dim, position):
     sinusoid = torch.outer(position, torch.pow(10000, -torch.arange(half).to(position).div(half)))
     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
     return x
-
-
-def rotate_half(x, interleaved=False):
-    if not interleaved:
-        x1, x2 = x.chunk(2, dim=-1)
-        return torch.cat((-x2, x1), dim=-1)
-    else:
-        x1, x2 = x[..., ::2], x[..., 1::2]
-        return rearrange(torch.stack((-x2, x1), dim=-1), "... d two -> ... (d two)", two=2)
-
-
-def apply_rotary_emb_torch(x, cos, sin, interleaved=False):
-    """
-    x: (batch_size, seqlen, nheads, headdim)
-    cos, sin: (seqlen, rotary_dim / 2) or (batch_size, seqlen, rotary_dim / 2)
-    """
-    ro_dim = cos.shape[-1] * 2
-    assert ro_dim <= x.shape[-1]
-    cos = repeat(cos, "... d -> ... 1 (2 d)" if not interleaved else "... d -> ... 1 (d 2)")
-    sin = repeat(sin, "... d -> ... 1 (2 d)" if not interleaved else "... d -> ... 1 (d 2)")
-    return torch.cat(
-        [
-            x[..., :ro_dim] * cos + rotate_half(x[..., :ro_dim], interleaved) * sin,
-            x[..., ro_dim:],
-        ],
-        dim=-1,
-    )
-
-
-def rope_apply(x, freqs, fused):
-    """
-    Optimized version of rope_apply using flash_attention's rotary embedding implementation.
-    This version processes the entire batch at once for efficiency.
-
-    Args:
-        x (Tensor): Input tensor with shape [batch_size, seq_len, n_heads, head_dim]
-        freqs (Tensor): Complex frequencies with shape [max_seq_len, head_dim // 2]
-
-    Returns:
-        Tensor: Rotary-embedded tensor with same shape as input
-    """
-    batch_size, seq_len, n_heads, head_dim = x.shape
-
-    # freqs is already sharded to local seq_len under flattened CP
-    freqs = freqs.view(seq_len, head_dim // 2)
-    cos = torch.cos(freqs).to(torch.float32)
-    sin = torch.sin(freqs).to(torch.float32)
-
-    # Apply the rotation
-    if fused:
-        rotated = flash_apply_rotary_emb(x.to(torch.float32), cos, sin, interleaved=True, inplace=False)
-    else:
-        rotated = apply_rotary_emb_torch(x.to(torch.float32), cos, sin, interleaved=True)
-
-    return rotated.to(x.dtype)
 
 
 class WanRMSNorm(JVP):
@@ -265,8 +253,13 @@ class WanSelfAttention(JVP):
         self.o = nn.Linear(dim, dim)
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        self.attn_op = MinimalA2AAttnOp(local_attn=naive_attention_op) if naive_attn else MinimalA2AAttnOp(local_attn=torch_attention_op)
-        self.attn_op_withT = MinimalA2AAttnOpWithT()
+        # To ensure precision, force using torch SPDA instead of FA3
+        self.attn_op = (
+            MinimalA2AAttnOp(local_attn=FlexOrSdpaLocalAttention(attn=torch_attention_op))
+            if not naive_attn
+            else MinimalA2AAttnOp(local_attn=naive_attention_op)
+        )
+        self.attn_op_withT = MinimalA2AAttnOpWithT(local_attn_T=FlexOrSdpaLocalAttentionWithT())
 
     def init_weights(self):
         std = 1.0 / math.sqrt(self.dim)
@@ -284,12 +277,12 @@ class WanSelfAttention(JVP):
             self.norm_q.reset_parameters()
             self.norm_k.reset_parameters()
 
-    def _forward(self, x: torch.Tensor, seq_lens, freqs):
+    def _forward(self, x: torch.Tensor, seq_lens, attn_ctx=None, attn_meta=None):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
             seq_lens(Tensor): Shape [B]
-            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            attn_ctx: Per-layer attention context (KV cache, RoPE freqs, observer).
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
@@ -302,14 +295,14 @@ class WanSelfAttention(JVP):
 
         q, k, v = qkv_fn(x)
 
-        x = self.attn_op(rope_apply(q, freqs, fused=False), rope_apply(k, freqs, fused=False), v)
+        x = self.attn_op(q, k, v, attn_ctx=attn_ctx, attn_meta=attn_meta)
 
         # output
         x = x.flatten(2)
         x = self.o(x)
         return x
 
-    def _forward_jvp(self, x: TensorWithT, seq_lens, freqs):
+    def _forward_jvp(self, x: TensorWithT, seq_lens, attn_ctx=None, attn_meta=None):
         x_withT = x
         x, t_x = x_withT
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
@@ -319,15 +312,13 @@ class WanSelfAttention(JVP):
             q = self.norm_q(self.q(x)).view(b, s, n, d)
             k = self.norm_k(self.k(x)).view(b, s, n, d)
             v = self.v(x).view(b, s, n, d)
-            q = rope_apply(q, freqs, fused=False)
-            k = rope_apply(k, freqs, fused=False)
             return q, k, v
 
         (q, k, v), (t_q, t_k, t_v) = torch.func.jvp(qkv_fn, (x,), (t_x,))
 
         q_withT, k_withT, v_withT = (q, t_q.detach()), (k, t_k.detach()), (v, t_v.detach())
 
-        x_withT = self.attn_op_withT(q_withT, k_withT, v_withT)
+        x_withT = self.attn_op_withT(q_withT, k_withT, v_withT, attn_ctx=attn_ctx, attn_meta=attn_meta)
         x, t_x = x_withT
 
         def _fn(x):
@@ -525,22 +516,22 @@ class WanAttentionBlock(JVP):
         std = 1.0 / math.sqrt(self.dim)
         torch.nn.init.trunc_normal_(self.modulation, std=std)
 
-    def _forward(self, x, e, seq_lens, freqs, context, context_lens):
+    def _forward(self, x, e, seq_lens, context, context_lens, attn_ctx=None, attn_meta=None):
         r"""
         Args:
             x(Tensor): Shape [B, L, C]
-            e(Tensor): Shape [B, 6, C]
+            e(Tensor): Shape [B, L, 6, C]
             seq_lens(Tensor): Shape [B], length of each sequence in batch
-            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            attn_ctx: Per-layer attention context (KV cache, RoPE freqs, observer).
         """
         assert e.dtype == torch.float32
         with amp.autocast("cuda", dtype=torch.float32):
-            e = (self.modulation + e).chunk(6, dim=1)
+            e = (self.modulation.unsqueeze(1) + e).unbind(dim=2)
             z = (self.norm1(x).float() * (1 + e[1]) + e[0]).type_as(x)
         assert e[0].dtype == torch.float32
 
         # self-attention
-        y = self.self_attn(z, seq_lens, freqs)
+        y = self.self_attn(z, seq_lens, attn_ctx=attn_ctx, attn_meta=attn_meta)
         with amp.autocast("cuda", dtype=torch.float32):
             x = (x + y * e[2]).type_as(x)
 
@@ -557,13 +548,22 @@ class WanAttentionBlock(JVP):
         x = cross_attn_ffn(x, z, e)
         return x
 
-    def _forward_jvp(self, x: TensorWithT, e: TensorWithT, seq_lens, freqs, context, context_lens):
+    def _forward_jvp(
+        self,
+        x: TensorWithT,
+        e: TensorWithT,
+        seq_lens,
+        context,
+        context_lens,
+        attn_ctx=None,
+        attn_meta=None,
+    ):
         r"""
         Args:
             x(Tensor): Shape [B, L, C]
-            e(Tensor): Shape [B, 6, C]
+            e(Tensor): Shape [B, L, 6, C]
             seq_lens(Tensor): Shape [B], length of each sequence in batch
-            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            attn_ctx: Per-layer attention context (KV cache, RoPE freqs, observer).
         """
         x_withT, e_withT = x, e
         x, t_x = x_withT
@@ -572,7 +572,7 @@ class WanAttentionBlock(JVP):
 
         def pre_self_attn_fn(x, e):
             with amp.autocast("cuda", dtype=torch.float32):
-                e = (self.modulation + e).chunk(6, dim=1)
+                e = (self.modulation.unsqueeze(1) + e).unbind(dim=2)
                 z = (self.norm1(x).float() * (1 + e[1]) + e[0]).type_as(x)
             return z, e
 
@@ -582,7 +582,7 @@ class WanAttentionBlock(JVP):
         z_withT, e_withT = (z, t_z.detach()), (e, tuple([_.detach() for _ in t_e]))
 
         # self-attention
-        y_withT = self.self_attn(z_withT, seq_lens, freqs, withT=True)
+        y_withT = self.self_attn(z_withT, seq_lens, attn_ctx=attn_ctx, attn_meta=attn_meta, withT=True)
         y, t_y = y_withT
 
         def pre_cross_attn_fn(x, e2, y):
@@ -636,19 +636,19 @@ class Head(JVP):
     def _forward(self, x, e):
         r"""
         Args:
-            x(Tensor): Shape [B, L1, C]
-            e(Tensor): Shape [B, C]
+            x(Tensor): Shape [B, L, C]
+            e(Tensor): Shape [B, L, C]
         """
         with amp.autocast("cuda", dtype=torch.float32):
-            e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
+            e = (self.modulation.unsqueeze(1) + e.unsqueeze(2)).unbind(dim=2)
             x = self.head(self.norm(x) * (1 + e[1]) + e[0])
         return x
 
     def _forward_jvp(self, x: TensorWithT, e: TensorWithT):
         r"""
         Args:
-            x(Tensor): Shape [B, L1, C]
-            e(Tensor): Shape [B, C]
+            x(Tensor): Shape [B, L, C]
+            e(Tensor): Shape [B, L, C]
         """
         x_withT, e_withT = x, e
         x, t_x = x_withT
@@ -788,6 +788,7 @@ class WanModel_JVP(JVP):
         d = dim // num_heads
 
         self.rope_position_embedding = VideoRopePosition3DEmb(head_dim=d, len_h=128, len_w=128, len_t=32)
+        self._rope_cache: dict = {}
 
         if model_type == "i2v" or model_type == "flf2v":
             self.img_emb = MLPProj(1280, dim, flf_pos_emb=model_type == "flf2v")
@@ -797,6 +798,49 @@ class WanModel_JVP(JVP):
 
         self.enable_selective_checkpoint(sac_config)
 
+    def get_spatial_patch_size(self):
+        return self.patch_size[1] * self.patch_size[2]
+
+    def allocate_kv_caches(self, max_len: int):
+        return [KVCache(max_len) for _ in range(self.num_layers)]
+
+    def _compute_rope(self, B, T, H, W, inference_state, attn_meta, use_fused) -> RopeCache:
+        gen = self.rope_position_embedding.generate_embeddings
+        t_offset = 0 if inference_state is None else int(inference_state.t_offset)
+        attn_mode = attn_meta.mode if attn_meta is not None else None
+        has_kv_cache = inference_state is not None and inference_state.mode != KVCacheMode.DISABLED
+
+        cache_key = (T, H, W, t_offset, attn_mode, has_kv_cache, use_fused)
+        cached_rope = self._rope_cache.get(cache_key)
+        if cached_rope is not None:
+            if inference_state is not None:
+                inference_state.rope = cached_rope
+            return cached_rope
+
+        if attn_mode == "teacher_forcing":
+            query_freqs = gen(torch.Size([B, T // 2, H, W, self.dim]), t_start=t_offset).repeat(2, 1)
+            key_freqs = query_freqs
+            current_key_freqs = query_freqs
+        else:
+            query_freqs = gen(torch.Size([B, T, H, W, self.dim]), t_start=t_offset)
+            if has_kv_cache:
+                key_freqs = gen(torch.Size([B, t_offset + T, H, W, self.dim]), t_start=0)
+                current_key_freqs = gen(torch.Size([B, T, H, W, self.dim]), t_start=t_offset)
+            else:
+                key_freqs = query_freqs
+                current_key_freqs = query_freqs
+        rope = RopeCache(
+            query_freqs=query_freqs,
+            key_freqs=key_freqs,
+            current_key_freqs=current_key_freqs,
+            use_fused=use_fused,
+            cached_k_rotated=True,
+        )
+        self._rope_cache[cache_key] = rope
+        if inference_state is not None:
+            inference_state.rope = rope
+        return rope
+
     def _forward(
         self,
         x_B_C_T_H_W,
@@ -804,28 +848,10 @@ class WanModel_JVP(JVP):
         crossattn_emb,
         frame_cond_crossattn_emb_B_L_D=None,
         y_B_C_T_H_W=None,
+        inference_state: Optional[CausalInferenceState] = None,
+        attn_meta: Optional[AttnMaskSpec] = None,
         **kwargs,
     ):
-        r"""
-        Forward pass through the diffusion model
-
-        Args:
-            x_B_C_T_H_W (Tensor):
-                Input video tensor with shape [B, C_in, T, H, W]
-            t (Tensor):
-                Diffusion timesteps tensor of shape [B]
-            context (List[Tensor]):
-                List of text embeddings each with shape [L, C]
-            frame_cond_crossattn_emb_B_L_D (Tensor, *optional*):
-                CLIP image features for image-to-video mode or first-last-frame-to-video mode
-            y_B_C_T_H_W (Tensor, *optional*):
-                Conditional video inputs for image-to-video mode, shape [B, C_in, T, H, W]
-
-        Returns:
-            Tensor:
-                Denoised video tensor with shape [B, C_out, T, H / 8, W / 8]
-        """
-
         cp_group = getattr(self, "_cp_group", None)
         cp_enabled = (cp_group is not None) and (cp_group.size() > 1)
         if cp_enabled:
@@ -837,8 +863,7 @@ class WanModel_JVP(JVP):
             if y_B_C_T_H_W is not None:
                 y_B_C_T_H_W = broadcast(y_B_C_T_H_W, cp_group)
 
-        assert timesteps_B_T.shape[1] == 1
-        t_B = timesteps_B_T[:, 0]
+        assert timesteps_B_T.ndim == 2, f"timesteps_B_T must be 2D [B, T], got {timesteps_B_T.shape}"
         del kwargs
         if self.model_type == "i2v" or self.model_type == "flf2v":
             assert frame_cond_crossattn_emb_B_L_D is not None and y_B_C_T_H_W is not None
@@ -851,6 +876,10 @@ class WanModel_JVP(JVP):
         assert (T_in % kt) == 0 and (H_in % kh) == 0 and (W_in % kw) == 0
         T, H, W = T_in // kt, H_in // kh, W_in // kw
         L = T * H * W
+
+        if timesteps_B_T.shape[1] == 1:
+            timesteps_B_T = timesteps_B_T.expand(-1, T)
+        assert timesteps_B_T.shape[1] == T, f"timesteps_B_T.shape[1]={timesteps_B_T.shape[1]} != T={T}"
 
         # patchify and flatten
         x_B_L_Din = rearrange(
@@ -869,11 +898,18 @@ class WanModel_JVP(JVP):
         x_B_L_D = self.patch_embedding(x_B_L_Din)
         seq_lens = torch.tensor([u.size(0) for u in x_B_L_D], dtype=torch.long)
 
-        # time embeddings
+        # per-token time embeddings
         with amp.autocast("cuda", dtype=torch.float32):
-            e_B_D = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t_B).float())
-            e0_B_6_D = self.time_projection(e_B_D).unflatten(1, (6, self.dim))
-        assert e_B_D.dtype == torch.float32 and e0_B_6_D.dtype == torch.float32
+            e_BT_D = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timesteps_B_T.reshape(-1)).float())
+            e0_B_T_6_D = self.time_projection(e_BT_D).view(B, T, 6, self.dim).contiguous()
+        e_B_T_D = e_BT_D.view(B, T, self.dim).contiguous()
+        e_B_L_D = repeat(e_B_T_D, "b t d -> b (t hw) d", hw=H * W).contiguous()
+        e0_B_L_6_D = repeat(e0_B_T_6_D, "b t m d -> b (t hw) m d", hw=H * W).contiguous()
+        assert e_B_L_D.dtype == torch.float32 and e0_B_L_6_D.dtype == torch.float32
+
+        if cp_enabled:
+            e_B_L_D = split_inputs_cp(e_B_L_D, seq_dim=1, cp_group=cp_group)
+            e0_B_L_6_D = split_inputs_cp(e0_B_L_6_D, seq_dim=1, cp_group=cp_group)
 
         # context
         context_lens = None
@@ -883,24 +919,25 @@ class WanModel_JVP(JVP):
             context_clip = self.img_emb(frame_cond_crossattn_emb_B_L_D)  # bs x 257 (x2) x dim
             context_B_L_D = torch.concat([context_clip, context_B_L_D], dim=1)
 
-        freqs = self.rope_position_embedding.generate_embeddings(torch.Size([B, T, H, W, self.dim])).contiguous()
-        if cp_enabled:
-            freqs = split_inputs_cp(freqs, seq_dim=self.rope_position_embedding.seq_dim, cp_group=cp_group)
+        shared_rope = self._compute_rope(B, T, H, W, inference_state, attn_meta, use_fused=False)
 
         # arguments
         kwargs = dict(
-            e=e0_B_6_D,
+            e=e0_B_L_6_D,
             seq_lens=seq_lens,
-            freqs=freqs,
             context=context_B_L_D,
             context_lens=context_lens,
         )
 
         for block_idx, block in enumerate(self.blocks):
-            x_B_L_D = block(x_B_L_D, **kwargs)
+            if inference_state is not None:
+                attn_ctx = inference_state.attn_ctx(block_idx)
+            else:
+                attn_ctx = AttnContext(rope=shared_rope)
+            x_B_L_D = block(x_B_L_D, **kwargs, attn_ctx=attn_ctx, attn_meta=attn_meta)
 
         # head
-        x_B_L_Dout = self.head(x_B_L_D, e_B_D)
+        x_B_L_Dout = self.head(x_B_L_D, e_B_L_D)
 
         if cp_enabled:
             if torch.is_grad_enabled():
@@ -930,6 +967,8 @@ class WanModel_JVP(JVP):
         crossattn_emb,
         frame_cond_crossattn_emb_B_L_D=None,
         y_B_C_T_H_W=None,
+        inference_state: Optional[CausalInferenceState] = None,
+        attn_meta: Optional[AttnMaskSpec] = None,
         **kwargs,
     ):
         x_B_C_T_H_W_withT, timesteps_B_T_withT = x_B_C_T_H_W, timesteps_B_T
@@ -949,9 +988,7 @@ class WanModel_JVP(JVP):
             if y_B_C_T_H_W is not None:
                 y_B_C_T_H_W = broadcast(y_B_C_T_H_W, cp_group)
 
-        assert timesteps_B_T.shape[1] == 1 and t_timesteps_B_T.shape[1] == 1
-        t_B = timesteps_B_T[:, 0]
-        t_t_B = t_timesteps_B_T[:, 0]
+        assert timesteps_B_T.ndim == 2 and t_timesteps_B_T.ndim == 2
         del kwargs
         if self.model_type == "i2v" or self.model_type == "flf2v":
             assert frame_cond_crossattn_emb_B_L_D is not None and y_B_C_T_H_W is not None
@@ -965,6 +1002,11 @@ class WanModel_JVP(JVP):
         assert (T_in % kt) == 0 and (H_in % kh) == 0 and (W_in % kw) == 0
         T, H, W = T_in // kt, H_in // kh, W_in // kw
         L = T * H * W
+
+        if timesteps_B_T.shape[1] == 1:
+            timesteps_B_T = timesteps_B_T.expand(-1, T)
+            t_timesteps_B_T = t_timesteps_B_T.expand(-1, T)
+        assert timesteps_B_T.shape[1] == T
 
         # patchify and flatten
         x_B_L_Din = rearrange(
@@ -991,20 +1033,34 @@ class WanModel_JVP(JVP):
         x_B_L_D, t_x_B_L_D = torch.func.jvp(self.patch_embedding, (x_B_L_Din,), (t_x_B_L_Din,))
         seq_lens = torch.tensor([u.size(0) for u in x_B_L_D], dtype=torch.long)
 
-        def time_embed_fn(t):
+        def time_embed_fn(t_flat):
             with amp.autocast("cuda", dtype=torch.float32):
-                e_B_D = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).float())
-                e0_B_6_D = self.time_projection(e_B_D).unflatten(1, (6, self.dim))
-            return e_B_D, e0_B_6_D
+                e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t_flat).float())
+                e0 = self.time_projection(e)
+            return e, e0
 
-        # time embeddings
-        (e_B_D, e0_B_6_D), (t_e_B_D, t_e0_B_6_D) = torch.func.jvp(time_embed_fn, (t_B,), (t_t_B,))
-        assert e_B_D.dtype == torch.float32 and e0_B_6_D.dtype == torch.float32
-        assert t_e_B_D.dtype == torch.float32 and t_e0_B_6_D.dtype == torch.float32
+        # per-token time embeddings with JVP
+        (e_BT_D, e0_BT_6D), (t_e_BT_D, t_e0_BT_6D) = torch.func.jvp(time_embed_fn, (timesteps_B_T.reshape(-1),), (t_timesteps_B_T.reshape(-1),))
+        e_B_T_D = e_BT_D.view(B, T, self.dim).contiguous()
+        e0_B_T_6_D = e0_BT_6D.view(B, T, 6, self.dim).contiguous()
+        e_B_L_D = repeat(e_B_T_D, "b t d -> b (t hw) d", hw=H * W).contiguous()
+        e0_B_L_6_D = repeat(e0_B_T_6_D, "b t m d -> b (t hw) m d", hw=H * W).contiguous()
+        t_e_B_T_D = t_e_BT_D.view(B, T, self.dim).contiguous()
+        t_e0_B_T_6_D = t_e0_BT_6D.view(B, T, 6, self.dim).contiguous()
+        t_e_B_L_D = repeat(t_e_B_T_D, "b t d -> b (t hw) d", hw=H * W).contiguous()
+        t_e0_B_L_6_D = repeat(t_e0_B_T_6_D, "b t m d -> b (t hw) m d", hw=H * W).contiguous()
+        assert e_B_L_D.dtype == torch.float32 and e0_B_L_6_D.dtype == torch.float32
+        assert t_e_B_L_D.dtype == torch.float32 and t_e0_B_L_6_D.dtype == torch.float32
+
+        if cp_enabled:
+            e_B_L_D = split_inputs_cp(e_B_L_D, seq_dim=1, cp_group=cp_group)
+            e0_B_L_6_D = split_inputs_cp(e0_B_L_6_D, seq_dim=1, cp_group=cp_group)
+            t_e_B_L_D = split_inputs_cp(t_e_B_L_D, seq_dim=1, cp_group=cp_group)
+            t_e0_B_L_6_D = split_inputs_cp(t_e0_B_L_6_D, seq_dim=1, cp_group=cp_group)
 
         x_B_L_D_withT = (x_B_L_D, t_x_B_L_D.detach())
-        e_B_D_withT = (e_B_D, t_e_B_D.detach())
-        e0_B_6_D_withT = (e0_B_6_D, t_e0_B_6_D.detach())
+        e_B_L_D_withT = (e_B_L_D, t_e_B_L_D.detach())
+        e0_B_L_6_D_withT = (e0_B_L_6_D, t_e0_B_L_6_D.detach())
 
         # context
         context_lens = None
@@ -1014,24 +1070,25 @@ class WanModel_JVP(JVP):
             context_clip = self.img_emb(frame_cond_crossattn_emb_B_L_D)  # bs x 257 (x2) x dim
             context_B_L_D = torch.concat([context_clip, context_B_L_D], dim=1)
 
-        freqs = self.rope_position_embedding.generate_embeddings(torch.Size([B, T, H, W, self.dim])).contiguous()
-        if cp_enabled:
-            freqs = split_inputs_cp(freqs, seq_dim=self.rope_position_embedding.seq_dim, cp_group=cp_group)
+        shared_rope = self._compute_rope(B, T, H, W, inference_state, attn_meta, use_fused=False)
 
         # arguments
         kwargs = dict(
-            e=e0_B_6_D_withT,
+            e=e0_B_L_6_D_withT,
             seq_lens=seq_lens,
-            freqs=freqs,
             context=context_B_L_D,
             context_lens=context_lens,
         )
 
         for block_idx, block in enumerate(self.blocks):
-            x_B_L_D_withT = block(x_B_L_D_withT, **kwargs, withT=True)
+            if inference_state is not None:
+                attn_ctx = inference_state.attn_ctx(block_idx)
+            else:
+                attn_ctx = AttnContext(rope=shared_rope)
+            x_B_L_D_withT = block(x_B_L_D_withT, **kwargs, attn_ctx=attn_ctx, attn_meta=attn_meta, withT=True)
 
         # head
-        x_B_L_Dout_withT = self.head(x_B_L_D_withT, e_B_D_withT, withT=True)
+        x_B_L_Dout_withT = self.head(x_B_L_D_withT, e_B_L_D_withT, withT=True)
         x_B_L_Dout, t_x_B_L_Dout = x_B_L_Dout_withT
 
         if cp_enabled:
@@ -1150,7 +1207,7 @@ class WanModel_JVP(JVP):
         _context_fn = sac_config.get_context_fn()
         for block_id, block in self.blocks.named_children():
             if int(block_id) % sac_config.every_n_blocks == 0:
-                block = ptd_checkpoint_wrapper(block, context_fn=_context_fn, preserve_rng_state=False)
+                block = CacheAwareCheckpointWrapper(block, context_fn=_context_fn, preserve_rng_state=False)
                 self.blocks.register_module(block_id, block)
         self.register_module("head", ptd_checkpoint_wrapper(self.head, context_fn=_context_fn, preserve_rng_state=False))
 

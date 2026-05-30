@@ -13,18 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# from neophilia; Author: Qsh (qsh.zh27@gmail.com)
+# from neophilia; Author: Qsh (qsh.zh27@gmail.com) Kaiwen Zheng (zkwthu@gmail.com)
 
-from typing import Any, Callable, List, Tuple, Union
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
 from einops import rearrange
-from torch import Tensor
 from torch.distributed import ProcessGroup
-from torch.nn import Module
 
 from rcm.utils.attention import attention
+from rcm.utils.kv_cache import AttnContext, KVCacheMode
+from rcm.utils.rope import apply_rope
 
 
 def post_all2all(local_seq_2_local_head, seq_world_size):
@@ -107,14 +107,14 @@ def async_a2a_communicate(
 
 class _SeqAllToAll(torch.autograd.Function):
     @staticmethod
-    def forward(ctx: Any, group: dist.ProcessGroup, input: Tensor, local_seq_2_local_head: bool) -> Tensor:
+    def forward(ctx: Any, group: dist.ProcessGroup, input: torch.Tensor, local_seq_2_local_head: bool) -> torch.Tensor:
         ctx.group = group
         res = single_all_to_all(input, local_seq_2_local_head, group, False)
         ctx.local_seq_2_local_head = local_seq_2_local_head
         return res
 
     @staticmethod
-    def backward(ctx: Any, *grad_output: Tensor) -> Tuple[None, Tensor, None]:
+    def backward(ctx: Any, *grad_output: torch.Tensor) -> Tuple[None, torch.Tensor, None]:
         return (None, _SeqAllToAll.apply(ctx.group, *grad_output, not ctx.local_seq_2_local_head), None)
 
 
@@ -123,13 +123,13 @@ class _SeqAllToAllQKV(torch.autograd.Function):
     def forward(
         ctx: Any,
         group: dist.ProcessGroup,
-        q: Tensor,
-        k: Tensor,
-        v: Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
         cp_size: int,
         cp_stream: torch.cuda.Stream,
         local_seq_2_local_head: bool,
-    ) -> Tuple[Tensor, Tensor, Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         ctx.group = group
         ctx.cp_size = cp_size
         ctx.cp_stream = cp_stream
@@ -138,52 +138,110 @@ class _SeqAllToAllQKV(torch.autograd.Function):
         return q, k, v
 
     @staticmethod
-    def backward(ctx: Any, *grad_output: Tensor) -> Tuple[None, Tensor, Tensor, Tensor, None, None, None]:
+    def backward(ctx: Any, *grad_output: torch.Tensor) -> Tuple[None, torch.Tensor, torch.Tensor, torch.Tensor, None, None, None]:
         q_grad, k_grad, v_grad = _SeqAllToAllQKV.apply(ctx.group, *grad_output, ctx.cp_size, ctx.cp_stream, not ctx.local_seq_2_local_head)
         return (None, q_grad, k_grad, v_grad, None, None, None)
 
 
 class DistributedAttention(torch.nn.Module):
-    """Initialization.
+    """Wraps a local attention op with optional Ulysses-style CP (A2A) + optional KV cache."""
 
-    Arguments:
-        local_attention (Module): local attention with q,k,v
-        sequence_process_group (ProcessGroup): sequence parallel process group
-    """
-
-    def __init__(self, local_attention: Union[Module, Callable]) -> None:
-        super(DistributedAttention, self).__init__()
+    def __init__(self, local_attention: Union[torch.nn.Module, Callable]) -> None:
+        super().__init__()
         self.local_attn = local_attention
         self.pg = None
         self.stream = None
 
-    def forward(self, query: Tensor, key: Tensor, value: Tensor, *args: Any, **kwargs) -> Tensor:
-        """forward
-
-        Arguments:
-            query (Tensor): query input to the layer
-            key (Tensor): key input to the layer
-            value (Tensor): value input to the layer
-            args: other args
-
-        Returns:
-            * output (Tensor): context output
-        """
-        if self.pg is None:
-            return self.local_attn(query, key, value, *args, **kwargs)
-        pg_size = dist.get_world_size(self.pg)
-        if pg_size < 2:
-            return self.local_attn(query, key, value, *args, **kwargs)
-
-        query_layer, key_layer, value_layer = _SeqAllToAllQKV.apply(self.pg, query, key, value, pg_size, self.stream, True)
-        context_layer = self.local_attn(query_layer, key_layer, value_layer, *args, **kwargs)
-
-        output = _SeqAllToAll.apply(self.pg, context_layer, False)
-        return output
-
     def set_context_parallel_group(self, group, stream):
         self.pg = group
         self.stream = stream
+
+    def _materialize_kv(self, key: torch.Tensor, value: torch.Tensor, attn_ctx: Optional[AttnContext]) -> Tuple[torch.Tensor, torch.Tensor]:
+        if attn_ctx is None or attn_ctx.kv_cache is None:
+            return key, value
+
+        cache = attn_ctx.kv_cache
+        if attn_ctx.mode == KVCacheMode.DISABLED:
+            return key, value
+        if attn_ctx.mode == KVCacheMode.APPEND:
+            if attn_ctx.block_range is not None:
+                assert attn_ctx.block_range == len(cache._cum_ends)
+            cache.append(key, value)
+            return cache.get()
+        if attn_ctx.mode == KVCacheMode.READONLY:
+            if attn_ctx.fast_infer:
+                prefix_end = cache.get_prefix_end(attn_ctx.block_range)
+                if prefix_end == 0:
+                    return key, value
+                return cache.write_transient(key, value, prefix_end)
+            k_cached, v_cached = cache.get(attn_ctx.block_range)
+            if k_cached is None:
+                return key, value
+            return torch.cat([k_cached, key], dim=1), torch.cat([v_cached, value], dim=1)
+        raise ValueError(f"Unknown KVCacheMode: {attn_ctx.mode}")
+
+    def _collect_attention_stats(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        key_current: torch.Tensor,
+        attn_ctx: Optional[AttnContext],
+    ):
+        if attn_ctx is None or attn_ctx.attn_observer is None:
+            return
+        cached_len = key.shape[1] - key_current.shape[1]
+        if cached_len <= 0:
+            return
+        attn_ctx.attn_observer.observe(
+            layer_idx=attn_ctx.layer_idx,
+            q_block_idx=attn_ctx.q_block_idx,
+            query=query.detach(),
+            key=key.detach(),
+            cached_len=cached_len,
+        )
+
+    def forward(
+        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, *args: Any, attn_ctx: Optional[AttnContext] = None, **kwargs
+    ) -> torch.Tensor:
+        """
+        query/key/value expected layout (before CP):
+          [B, S_local, H_total, D]
+        If CP enabled, A2A converts Q/K/V to:
+          [B, S_global (=cp*S_local), H_local (=H_total/cp), D]
+        KV cache is stored in the SAME layout as local_attn sees.
+        """
+
+        pg_size = 1 if self.pg is None else dist.get_world_size(self.pg)
+        if pg_size > 1:
+            # A2A (Q/K/V): local_seq->global_seq, total_heads->local_heads
+            query, key, value = _SeqAllToAllQKV.apply(self.pg, query, key, value, pg_size, self.stream, True)
+
+        key_current = key
+        rope = attn_ctx.rope if attn_ctx is not None else None
+
+        if rope is not None and rope.cached_k_rotated and rope.current_key_freqs is not None:
+            key = apply_rope(key, rope.current_key_freqs, fused=rope.use_fused)
+
+        if rope is not None and rope.query_freqs is not None:
+            query = apply_rope(query, rope.query_freqs, fused=rope.use_fused)
+
+        if getattr(self.local_attn, "manages_kv_cache", False):
+            if getattr(self.local_attn, "accepts_attn_ctx", False):
+                out = self.local_attn(query, key, value, *args, attn_ctx=attn_ctx, **kwargs)
+            else:
+                out = self.local_attn(query, key, value, *args, **kwargs)
+        else:
+            key, value = self._materialize_kv(key, value, attn_ctx)
+            if rope is not None and not rope.cached_k_rotated:
+                key = apply_rope(key, rope.key_freqs, fused=rope.use_fused)
+
+            self._collect_attention_stats(query, key, key_current, attn_ctx)
+            out = self.local_attn(query, key, value, *args, attn_ctx=attn_ctx, **kwargs)
+
+        if pg_size > 1:
+            # A2A back: global_seq->local_seq, local_heads->total_heads
+            out = _SeqAllToAll.apply(self.pg, out, False)
+        return out
 
 
 class MinimalA2AAttnOp(DistributedAttention):
@@ -195,6 +253,6 @@ class MinimalA2AAttnOp(DistributedAttention):
         del ranks
         super().set_context_parallel_group(process_group, stream)
 
-    def forward(self, query: Tensor, key: Tensor, value: Tensor, *args: Any, **kwargs) -> Tensor:
+    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, *args: Any, **kwargs) -> torch.Tensor:
         results = super().forward(query, key, value, *args, **kwargs)
         return rearrange(results, "b ... h l -> b ... (h l)")

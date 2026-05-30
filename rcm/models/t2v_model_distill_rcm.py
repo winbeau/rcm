@@ -19,7 +19,7 @@ import collections
 import math
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Tuple, Literal
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple, Literal
 
 import attrs
 import numpy as np
@@ -114,6 +114,9 @@ class T2VDistillConfig_rCM:
 
     # dcm: discrete-time CM; scm: continuous-time CM
     cm_type: Literal["scm", "dcm"] = "scm"
+    # Use direct Rectified Flow velocity/JVP for scm instead of the TrigFlow wrapper
+    # Simpler implementation and similar performance
+    use_rf_scm: bool = False
     dcm_total_steps: int = 48
     dcm_skipping_interval_steps: int = 1
     dcm_timestep_shift: float = 5.0
@@ -369,6 +372,39 @@ class T2VDistillModel_rCM(ImaginaireModel):
     def draw_training_time_D(self, time_shape: Any) -> torch.Tensor:
         return rf_to_trig_time(self._sample_rf_time(self.p_D, time_shape))
 
+    def _predict_rf_velocity(
+        self,
+        xt_B_C_T_H_W: torch.Tensor,
+        time_B_T: torch.Tensor,
+        condition: TextCondition,
+        net_type: Literal["teacher", "fake_score", "student"] = "teacher",
+    ) -> torch.Tensor:
+        """Direct Rectified Flow velocity prediction, without TrigFlow preconditioning."""
+        net = {"student": self.net, "teacher": self.net_teacher, "fake_score": self.net_fake_score}[net_type]
+        return net(
+            x_B_C_T_H_W=xt_B_C_T_H_W.to(**self.tensor_kwargs),
+            timesteps_B_T=(time_B_T * self.config.rectified_flow_t_scaling_factor).to(**self.tensor_kwargs),
+            **condition.to_dict(),
+        ).float()
+
+    def student_v_withT_rf(self, xt_B_C_T_H_W: TensorWithT, time_B_T: TensorWithT, condition: TextCondition) -> TensorWithT:
+        xt_B_C_T_H_W, t_xt_B_C_T_H_W = xt_B_C_T_H_W
+        time_B_T, t_time_B_T = time_B_T
+        v_pred_B_C_T_H_W, t_v_pred_B_C_T_H_W = self.net(
+            x_B_C_T_H_W=(
+                xt_B_C_T_H_W.to(**self.tensor_kwargs),
+                t_xt_B_C_T_H_W.to(**self.tensor_kwargs),
+            ),
+            timesteps_B_T=(
+                (time_B_T * self.config.rectified_flow_t_scaling_factor).to(**self.tensor_kwargs),
+                (t_time_B_T * self.config.rectified_flow_t_scaling_factor).to(**self.tensor_kwargs),
+            ),
+            **condition.to_dict(),
+            withT=True,
+        )
+        v_pred_B_C_T_H_W, t_v_pred_B_C_T_H_W = v_pred_B_C_T_H_W.float(), t_v_pred_B_C_T_H_W.float()
+        return (v_pred_B_C_T_H_W, t_v_pred_B_C_T_H_W.detach())
+
     def denoise(
         self,
         xt_B_C_T_H_W: torch.Tensor,
@@ -588,6 +624,61 @@ class T2VDistillModel_rCM(ImaginaireModel):
         }
         return output_batch, kendall_loss
 
+    def _student_rf_scm_step(self, ctx, iteration):
+        log.debug(f"Student update {iteration} (RF sCM)")
+        x0_B_C_T_H_W, condition, uncondition = ctx
+        time_B_1 = self._sample_rf_time(self.p_G, (x0_B_C_T_H_W.shape[0], 1))
+        epsilon_B_C_T_H_W = torch.randn(x0_B_C_T_H_W.size(), device="cuda")
+        time_B_1, epsilon_B_C_T_H_W = self.sync(time_B_1, epsilon_B_C_T_H_W)
+
+        B, _, T, _, _ = x0_B_C_T_H_W.shape
+        time_B_T = repeat(time_B_1, "b 1 -> b t", t=T)
+        time_B_1_T_1_1 = rearrange(time_B_T, "b t -> b 1 t 1 1")
+        xt_B_C_T_H_W = (1 - time_B_1_T_1_1) * x0_B_C_T_H_W + time_B_1_T_1_1 * epsilon_B_C_T_H_W
+
+        with torch.no_grad():
+            v_teacher_B_C_T_H_W = self._predict_rf_velocity(xt_B_C_T_H_W, time_B_T, condition, net_type="teacher")
+            if self.config.teacher_guidance > 1.0:
+                v_teacher_uncond_B_C_T_H_W = self._predict_rf_velocity(xt_B_C_T_H_W, time_B_T, uncondition, net_type="teacher")
+                v_teacher_B_C_T_H_W = v_teacher_uncond_B_C_T_H_W + self.config.teacher_guidance * (v_teacher_B_C_T_H_W - v_teacher_uncond_B_C_T_H_W)
+
+        t_xt_B_C_T_H_W = v_teacher_B_C_T_H_W
+        t_time_B_T = torch.ones_like(time_B_T)
+
+        with torch.no_grad():
+            _, t_v_theta_B_C_T_H_W = self.student_v_withT_rf((xt_B_C_T_H_W, t_xt_B_C_T_H_W), (time_B_T, t_time_B_T), condition)
+
+        v_theta_B_C_T_H_W = self._predict_rf_velocity(xt_B_C_T_H_W, time_B_T, condition, net_type="student")
+        v_theta_B_C_T_H_W_sg = v_theta_B_C_T_H_W.clone().detach()
+
+        warmup_ratio = 1.0 if self.config.tangent_warmup == 0 else min(1.0, iteration / self.config.tangent_warmup)
+        g_B_C_T_H_W = -(v_theta_B_C_T_H_W_sg - v_teacher_B_C_T_H_W) - warmup_ratio * time_B_1_T_1_1 * t_v_theta_B_C_T_H_W
+
+        with torch.no_grad():
+            nan_mask_g = torch.isnan(g_B_C_T_H_W).flatten(start_dim=1).any(dim=1).view(B, 1, 1, 1, 1).expand_as(g_B_C_T_H_W)
+            nan_mask_v = torch.isnan(v_theta_B_C_T_H_W).flatten(start_dim=1).any(dim=1).view(B, 1, 1, 1, 1).expand_as(v_theta_B_C_T_H_W)
+        nan_mask = nan_mask_g | nan_mask_v
+        g_B_C_T_H_W[nan_mask] = 0
+        v_theta_B_C_T_H_W = torch.where(nan_mask, torch.tensor(0.0, device=v_theta_B_C_T_H_W.device), v_theta_B_C_T_H_W)
+        v_theta_B_C_T_H_W_sg[nan_mask] = 0
+
+        g_B_C_T_H_W = g_B_C_T_H_W.double() / (g_B_C_T_H_W.double().norm(p=2, dim=(1, 2, 3, 4), keepdim=True) + 0.1)
+        loss_scm = ((v_theta_B_C_T_H_W - v_theta_B_C_T_H_W_sg - g_B_C_T_H_W) ** 2).sum(dim=(1, 2, 3, 4))
+        kendall_loss = self.config.loss_scale * loss_scm
+
+        x0_teacher_B_C_T_H_W = xt_B_C_T_H_W - time_B_1_T_1_1 * v_teacher_B_C_T_H_W
+        x0_theta_B_C_T_H_W = xt_B_C_T_H_W - time_B_1_T_1_1 * v_theta_B_C_T_H_W
+        output_batch = {
+            "x0": x0_B_C_T_H_W.detach().cpu(),
+            "xt": xt_B_C_T_H_W.detach().cpu(),
+            "time": time_B_1.detach().cpu(),
+            "nan_mask_g": nan_mask_g.detach().cpu(),
+            "nan_mask_F_theta": nan_mask_v.detach().cpu(),
+            "teacher_pred": DenoisePrediction(x0_teacher_B_C_T_H_W.detach().cpu(), v_teacher_B_C_T_H_W.detach().cpu()),
+            "model_pred": DenoisePrediction(x0_theta_B_C_T_H_W.detach().cpu(), v_theta_B_C_T_H_W.detach().cpu()),
+        }
+        return output_batch, kendall_loss
+
     def _student_dcm_step(self, ctx, iteration):
         log.debug(f"Student update {iteration} (dCM)")
         x0_B_C_T_H_W, condition, uncondition = ctx
@@ -699,7 +790,9 @@ class T2VDistillModel_rCM(ImaginaireModel):
         }
         return output_batch, kendall_loss
 
-    def training_step_closures(self, data_batch, iteration: int):
+    def training_step_closures(
+        self, data_batch, iteration: int
+    ) -> Iterator[Tuple[str, Callable[[], Tuple[Dict[str, torch.Tensor], torch.Tensor]], bool]]:
         _, x0_B_C_T_H_W, condition, uncondition = self.get_data_and_condition(data_batch)
 
         ctx = self._make_training_ctx(x0_B_C_T_H_W, condition, uncondition, iteration)
@@ -709,10 +802,14 @@ class T2VDistillModel_rCM(ImaginaireModel):
             emit_dmd = self.net_fake_score and iteration >= self.config.tangent_warmup and self.config.loss_scale_dmd > 0
 
             if emit_cm:
-                if self.config.cm_type == "scm":
+                if self.config.cm_type == "scm" and self.config.use_rf_scm:
+                    yield "rf_scm", lambda: self._student_rf_scm_step(ctx, iteration), not emit_dmd
+                elif self.config.cm_type == "scm":
                     yield "scm", lambda: self._student_scm_step(ctx, iteration), not emit_dmd
-                else:
+                elif self.config.cm_type == "dcm":
                     yield "dcm", lambda: self._student_dcm_step(ctx, iteration), not emit_dmd
+                else:
+                    raise ValueError(f"Unknown cm_type: {self.config.cm_type}")
 
             if emit_dmd:
                 yield "dmd", lambda: self._student_dmd_step(ctx, iteration), True
