@@ -21,7 +21,7 @@
 <p>
 
 <p align="center">
-<img src="assets/causal-teaser.png" width=95%>
+<img src="assets/causal-teaser.png" width=60%>
   <p align="center">
     Illustration of <b>Causal-rCM</b>.
   </p>
@@ -228,5 +228,11 @@ We thank the [Cosmos-Predict2](https://github.com/nvidia-cosmos/cosmos-predict2)
   author={Zheng, Kaiwen and Wang, Yuji and Ma, Qianli and Chen, Huayu and Zhang, Jintao and Balaji, Yogesh and Chen, Jianfei and Liu, Ming-Yu and Zhu, Jun and Zhang, Qinsheng},
   journal={arXiv preprint arXiv:2510.08431},
   year={2025}
+}
+@article{zheng2026causal,
+  title={Causal-rCM: Teacher-Forcing meets Self-Forcing in Autoregressive Diffusion Distillation for Streaming Video Generation and Interactive World Models},
+  author={Zheng, Kaiwen and He, Guande and Zhao, Min and Zhu, Hongzhou and Zhang, Jintao and Chen, Huayu and Chen, Jianfei and Lin, Chen-Hsuan and Liu, Ming-Yu and Zhu, Jun and Ma, Qianli},
+  journal={TODO},
+  year={2026}
 }
 ```

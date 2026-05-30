@@ -63,7 +63,7 @@ The same `BlockPattern` drives packed training masks, self-forcing replay, infer
 ## Noisy Context
 
 <p align="center">
-  <img src="assets/diagonal.png" width="95%">
+  <img src="assets/diagonal.png" width="66%">
 </p>
 
 By default, causal inference appends a clean `t=0` KV state after each generated chunk. This is simple and robust, but it requires an extra clean forward pass per chunk (e.g., 4-step generation requires 5 forward passes per chunk).
@@ -153,12 +153,12 @@ torchrun --nproc_per_node=8 \
         dataloader_train.tar_path_pattern=${DATASET_ROOT}/shard*.tar
 ```
 
-Use the corresponding `df` experiment, such as `causal_wan2pt1_1pt3B_res480p_t2v_df_c1-1`, for diffusion-forcing adaptation. The resulting checkpoint becomes `model.config.causal_teacher_ckpt` for TF-CM distillation.
+Use the corresponding `df` experiment, such as `causal_wan2pt1_1pt3B_res480p_t2v_df_c1-1`, for diffusion-forcing training. The resulting checkpoint becomes `model.config.causal_teacher_ckpt` for TF-CM distillation.
 
 ### 2. Teacher-Forcing CM Distillation
 
 <p align="center">
-  <img src="assets/dcm_vs_scm.png" width="95%">
+  <img src="assets/dcm_vs_scm.png" width="60%">
 </p>
 
 Discrete-time CM (slower convergence, but more robust as initialization):
