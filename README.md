@@ -162,7 +162,7 @@ git clone https://huggingface.co/worstcoder/Wan assets/checkpoints
 
 rCM and Causal-rCM checkpoints can be placed in the same `assets/checkpoints` directory. See [`Causal_rCM.md`](Causal_rCM.md) for causal checkpoint naming and per-step inference commands.
 
-Our code is based on FSDP2 and relies on [Distributed Checkpoint (DCP)](https://docs.pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html) for loading and saving checkpoints. Before training, convert `.pth` teacher checkpoints to `.dcp` first:
+Our code is based on FSDP2 and relies on [Distributed Checkpoint (DCP)](https://docs.pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html) for loading and saving checkpoints. Before training, optionally convert `.pth` teacher checkpoints to `.dcp` first (this step can be ommited now, because the current code also supports loading `.pth`/`.pt` directly):
 
 ```bash
 python -m torch.distributed.checkpoint.format_utils torch_to_dcp assets/checkpoints/Wan2.1-T2V-1.3B.pth assets/checkpoints/Wan2.1-T2V-1.3B.dcp

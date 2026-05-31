@@ -125,18 +125,7 @@ CHECKPOINT_ROOT=${WORKDIR}/assets/checkpoints
 DATASET_ROOT=${WORKDIR}/assets/datasets/Wan2.1_14B_480p_16:9_Euler-step100_shift-3.0_cfg-5.0_seed-0_250K
 ```
 
-The Wan2.1 VAE and umT5 text encoder can be obtained from the official [Wan-Video/Wan2.1](https://github.com/Wan-Video/Wan2.1) repository. To download all required checkpoints into the `assets/checkpoints/` directory, run:
-
-```bash
-mkdir assets/checkpoints
-cd assets/checkpoints
-
-# Wan2.1 VAE and text encoder
-wget https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B/resolve/main/Wan2.1_VAE.pth
-wget https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B/resolve/main/models_t5_umt5-xxl-enc-bf16.pth
-
-cd ..
-```
+See the `Checkpoints Downloading` and `Dataset Downloading` sections in README.
 
 ### 1. Causal Teacher Training
 
@@ -360,4 +349,4 @@ VBench helpers are included for both T2V and I2V:
 - `evaluation/vbench_i2v/cal_scores_i2v.py`
 - `evaluation/vbench_i2v/eval_i2v_dims.py`
 
-See the README files ([VBench-T2V](evaluation\vbench_text2video\README.md),[VBench-I2V](evaluation\vbench_i2v\README.md)) in each evaluation subdirectory for command examples.
+See the README files ([VBench-T2V](evaluation/vbench_text2video/README.md),[VBench-I2V](evaluation/vbench_i2v/README.md)) in each evaluation subdirectory for command examples.
