@@ -1,16 +1,71 @@
 from dataclasses import dataclass, replace
+from functools import partial
+import os
 from typing import Optional, Literal, Dict, Tuple, List
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+from torch.nn.attention.flex_attention import flex_attention as torch_flex_attention, create_block_mask
 from rcm.utils.attention import attention
 
-flex_attention = torch.compile(flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
+
+def _compile_flex_attention():
+    backend = os.environ.get("RCM_FLEX_BACKEND", "auto").lower()
+    if backend not in {"auto", "triton", "flash"}:
+        raise ValueError(f"Unsupported RCM_FLEX_BACKEND={backend!r}; expected one of auto, triton, flash")
+
+    flex_fn = torch_flex_attention
+    if backend != "auto":
+        # PyTorch FlexAttention uses BACKEND="FLASH" for the FA4/CuTe backend.
+        flex_fn = partial(torch_flex_attention, kernel_options={"BACKEND": backend.upper()})
+
+    return torch.compile(flex_fn, dynamic=False, mode=os.environ.get("RCM_FLEX_COMPILE_MODE", "max-autotune-no-cudagraphs"))
+
+
+flex_attention = _compile_flex_attention()
 
 
 def flex_attention_op(q_B_S_H_D, k_B_S_H_D, v_B_S_H_D, block_mask):
     return flex_attention(q_B_S_H_D.transpose(1, 2), k_B_S_H_D.transpose(1, 2), v_B_S_H_D.transpose(1, 2), block_mask=block_mask).transpose(1, 2)
+
+
+def _call_magi_flex_flash(q, k, v, q_ranges, k_ranges):
+    try:
+        from magi_attention.api import flex_flash_attn_func
+    except ImportError as exc:
+        raise ImportError(
+            "RCM_ATTENTION_BACKEND=magi requires the optional `magi_attention` package. "
+            "Install SandAI MagiAttention or use RCM_ATTENTION_BACKEND=flex."
+        ) from exc
+
+    B, Q, H, D = q.shape
+    KV = k.shape[1]
+    num_ranges = q_ranges.shape[0]
+
+    q_offsets = (torch.arange(B, device=q.device, dtype=torch.int32) * Q).view(B, 1, 1)
+    k_offsets = (torch.arange(B, device=k.device, dtype=torch.int32) * KV).view(B, 1, 1)
+    q_ranges = (q_ranges.view(1, num_ranges, 2) + q_offsets).reshape(B * num_ranges, 2).contiguous()
+    k_ranges = (k_ranges.view(1, num_ranges, 2) + k_offsets).reshape(B * num_ranges, 2).contiguous()
+    # MagiAttention uses 0 for FULL slices. The local mask builder already splits
+    # causal patterns into full rectangles, so every emitted slice is FULL.
+    attn_type_map = torch.zeros((B * num_ranges,), device=q.device, dtype=torch.int32)
+
+    q_flat = q.reshape(B * Q, H, D).contiguous()
+    k_flat = k.reshape(B * KV, H, D).contiguous()
+    v_flat = v.reshape(B * KV, H, D).contiguous()
+    kwargs = dict(
+        q=q_flat,
+        k=k_flat,
+        v=v_flat,
+        q_ranges=q_ranges,
+        k_ranges=k_ranges,
+        attn_type_map=attn_type_map,
+        softmax_scale=None,
+        softcap=0,
+    )
+
+    out, _meta = flex_flash_attn_func(num_heads_q=H, num_heads_kv=H, head_dim=D, **kwargs)
+    return out.reshape(B, Q, H, D)
 
 
 @dataclass(frozen=True)
@@ -119,6 +174,21 @@ def _ceil_to_multiple(x: int, m: int) -> int:
     return ((x + m - 1) // m) * m
 
 
+def _cuda_compute_capability(device: torch.device) -> int:
+    if torch.cuda.is_available() and device.type == "cuda":
+        major, minor = torch.cuda.get_device_capability(device)
+        return major * 10 + minor
+    return 0
+
+
+def _flex_block_size(mask_block_size, device: torch.device) -> Tuple[int, int]:
+    if isinstance(mask_block_size, tuple):
+        return mask_block_size
+    if os.environ.get("RCM_FLEX_BACKEND", "auto").lower() == "flash" and _cuda_compute_capability(device) >= 100:
+        return 256, int(mask_block_size)
+    return int(mask_block_size), int(mask_block_size)
+
+
 class FlexOrSdpaLocalAttention(nn.Module):
     """
     local_attn(q,k,v): [B,S,H,D] -> [B,S,H,D]
@@ -127,16 +197,28 @@ class FlexOrSdpaLocalAttention(nn.Module):
     - else: FlexAttention + BlockMask, with right-padding to multiples of mask_block_size (default 128)
     """
 
-    def __init__(self, attn=attention, flex_attn=flex_attention_op, mask_block_size: int = 128, compile_block_mask: bool = True):
+    def __init__(
+        self,
+        attn=attention,
+        flex_attn=flex_attention_op,
+        mask_block_size: int = 128,
+        compile_block_mask: bool = True,
+        backend: Optional[Literal["flex", "magi"]] = None,
+    ):
         super().__init__()
         self.attn = attn
         self.flex_attn = flex_attn
         self.mask_block_size = mask_block_size
         self.compile_block_mask = compile_block_mask
+        self.backend = (backend or os.environ.get("RCM_ATTENTION_BACKEND", "flex")).lower()
+        if self.backend not in {"flex", "magi"}:
+            raise ValueError(f"Unsupported attention backend {self.backend!r}; expected flex or magi")
         self._bm_cache: Dict[Tuple, object] = {}
+        self._magi_cache: Dict[Tuple, Tuple[torch.Tensor, torch.Tensor]] = {}
 
     def clear_mask_cache(self):
         self._bm_cache.clear()
+        self._magi_cache.clear()
 
     def _make_mask_fn(self, spec: AttnMaskSpec, Q_real: int, KV_real: int):
         mode = spec.mode
@@ -231,9 +313,9 @@ class FlexOrSdpaLocalAttention(nn.Module):
 
         raise ValueError(f"Unknown mask mode: {mode}")
 
-    def _get_block_mask(self, spec: AttnMaskSpec, Q_real: int, KV_real: int, Q_pad: int, KV_pad: int, device: torch.device):
+    def _get_block_mask(self, spec: AttnMaskSpec, Q_real: int, KV_real: int, Q_pad: int, KV_pad: int, device: torch.device, block_size):
         mask_fn, sig = self._make_mask_fn(spec, Q_real=Q_real, KV_real=KV_real)
-        key = (sig, Q_pad, KV_pad, device.type, device.index, self.mask_block_size, self.compile_block_mask)
+        key = (sig, Q_pad, KV_pad, device.type, device.index, block_size, self.compile_block_mask)
 
         bm = self._bm_cache.get(key, None)
         if bm is None:
@@ -244,11 +326,21 @@ class FlexOrSdpaLocalAttention(nn.Module):
                 Q_LEN=Q_pad,
                 KV_LEN=KV_pad,
                 device=device,
-                BLOCK_SIZE=self.mask_block_size,
+                BLOCK_SIZE=block_size,
                 _compile=self.compile_block_mask,
             )
             self._bm_cache[key] = bm
         return bm
+
+    def _get_magi_ranges(self, spec: AttnMaskSpec, Q_real: int, KV_real: int, device: torch.device):
+        key = (spec, Q_real, KV_real, device.type, device.index)
+        cached = self._magi_cache.get(key, None)
+        if cached is None:
+            from rcm.utils.magimask import make_magi_ranges_full
+
+            cached = make_magi_ranges_full(spec, Q_real=Q_real, KV_real=KV_real, device=device)
+            self._magi_cache[key] = cached
+        return cached
 
     def forward(self, q, k, v, attn_meta: Optional[AttnMaskSpec] = None, **_ignored):
         # q,k,v: [B, S, H, D]
@@ -269,10 +361,17 @@ class FlexOrSdpaLocalAttention(nn.Module):
             if (Q == pat.get_block_tokens(q_blk)) and (KV <= pat.blocks_to_tokens(q_blk + 1)):
                 return self.attn(q, k, v)
 
-        Q_pad = _ceil_to_multiple(Q, self.mask_block_size)
-        KV_pad = _ceil_to_multiple(KV, self.mask_block_size)
+        if self.backend == "magi":
+            q_ranges, k_ranges = self._get_magi_ranges(spec, Q_real=Q, KV_real=KV, device=q.device)
+            return _call_magi_flex_flash(q, k, v, q_ranges, k_ranges)
 
-        block_mask = self._get_block_mask(spec, Q_real=Q, KV_real=KV, Q_pad=Q_pad, KV_pad=KV_pad, device=q.device)
+        q_block_size, kv_block_size = _flex_block_size(self.mask_block_size, q.device)
+        Q_pad = _ceil_to_multiple(Q, q_block_size)
+        KV_pad = _ceil_to_multiple(KV, kv_block_size)
+
+        block_mask = self._get_block_mask(
+            spec, Q_real=Q, KV_real=KV, Q_pad=Q_pad, KV_pad=KV_pad, device=q.device, block_size=(q_block_size, kv_block_size)
+        )
 
         # right-pad q to Q_pad
         if Q_pad != Q:

@@ -512,6 +512,10 @@ class T2VDistillModel_rCM(ImaginaireModel):
         return (F_pred_B_C_T_H_W, t_F_pred_B_C_T_H_W.detach())
 
     def backward_simulation(self, condition, x_B_C_T_H_W_size, n_steps, with_grad: bool = False):
+        if self.config.dmd_fix_timesteps:
+            assert len(self.config.backward_timesteps) >= n_steps - 1, (
+                f"dmd_fix_timesteps=True requires at least {n_steps - 1} " f"backward_timesteps, got {len(self.config.backward_timesteps)}"
+            )
         G_time_B_1 = math.pi / 2 * torch.ones(x_B_C_T_H_W_size[0], 1, device="cuda")
         x_B_C_T_H_W = torch.randn(x_B_C_T_H_W_size, device="cuda")
         x_B_C_T_H_W = self.sync(x_B_C_T_H_W)

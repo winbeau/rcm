@@ -304,6 +304,8 @@ PYTHONPATH=. python rcm/inference/wan2pt1_t2v_causal_quant_infer.py \
     --distilled \
     --dit_path assets/checkpoints/Wan2.1_T2V_1.3B_480p_causal_chunkwise.pt \
     --num_steps 4 \
+    --first_chunk_t 3 \
+    --chunk_t 3 \
     --kv_dtype_k int2 \
     --kv_dtype_v int2 \
     --kv_smoothing_k qvg \
@@ -328,6 +330,8 @@ PYTHONPATH=. python rcm/inference/wan2pt1_t2v_causal_extrapolation_infer.py \
     --distilled \
     --dit_path assets/checkpoints/Wan2.1_T2V_1.3B_480p_causal_chunkwise.pt \
     --num_steps 4 \
+    --first_chunk_t 3 \
+    --chunk_t 3 \
     --extrapolation_method infinity_rope \
     --cache_blocks 6 \
     --ir_sink_blocks 1 \

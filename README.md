@@ -84,15 +84,39 @@ pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytor
 pip install megatron-core hydra-core loguru attrs fvcore nvidia-ml-py imageio[ffmpeg] pandas wandb psutil ftfy regex transformers webdataset safetensors
 # transformer_engine
 pip install --no-build-isolation transformer_engine[pytorch]
-# flash_attn
+# FlashAttention-2
 git clone https://github.com/Dao-AILab/flash-attention.git
 cd flash-attention
 git checkout v2.7.4.post1
 MAX_JOBS=4 python setup.py install
-# (Optional) flash attention 3 (2x speed on Hopper)
+
+# (Optional) FlashAttention-3 dense attention backend on Hopper.
 git checkout main
 cd hopper
 MAX_JOBS=4 python setup.py install
+python -c "import flash_attn_interface; print('FA3 installed')"
+cd ..
+
+# (Optional) FlashAttention-4 / CuTeDSL backend for PyTorch FlexAttention on Hopper and Blackwell.
+pip install flash-attn-4
+# For CUDA 13, use: pip install "flash-attn-4[cu13]"
+python -c "from flash_attn.cute import flash_attn_func; print('FA4 installed')"
+export RCM_FLEX_BACKEND=flash  # use "auto" or "triton" to fall back to PyTorch FlexAttention defaults
+cd ..
+
+# (Optional) MagiAttention backend for masked attention
+git clone https://github.com/SandAI-org/MagiAttention.git
+cd MagiAttention
+git submodule update --init --recursive
+pip install -r requirements.txt
+# MagiAttention recommends CUDA 13+; for CUDA 12.x builds (e.g. cu126 above), explicitly allow it:
+# export MAGI_ATTENTION_ALLOW_BUILD_WITH_CUDA12=1
+# For Ampere/Blackwell FA4 paths, set the MagiAttention FA4 envs before install as needed:
+# export MAGI_ATTENTION_PREBUILD_FFA=0
+# export MAGI_ATTENTION_FA4_BACKEND=1
+pip install --no-build-isolation .
+cd ..
+export RCM_ATTENTION_BACKEND=magi
 ```
 
 ## Inference

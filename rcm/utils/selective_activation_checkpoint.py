@@ -51,7 +51,8 @@ def mm_only_policy(ctx, func, *args, **kwargs):
     However, FA2 is much slower (2-3x) than FA3 or cuDNN kernel. Registering cuDNN kernel would require heavy changes in TE code.
     That's why the best option is to use FA3 with small modifications to flash_attn_interface.py to register FA3 as PyTorch op.
     """
-    to_save = func in mm_only_save_list or "flash_attn" in str(func)
+    func_name = str(func)
+    to_save = func in mm_only_save_list or "flash_attn" in func_name or "magi" in func_name or func_name == "inductor_compiled_code"
     return CheckpointPolicy.MUST_SAVE if to_save else CheckpointPolicy.PREFER_RECOMPUTE
 
 
