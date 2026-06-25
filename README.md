@@ -1,5 +1,5 @@
 <h1 align="center"> rCM: Score-Regularized Continuous-Time Consistency Model </h1>
-<h1 align="center"> Causal-rCM: Teacher-Forcing meets Self-Forcing in Autoregressive Diffusion Distillation for Streaming Video Generation and Interactive World Models </h1>
+<h1 align="center"> Causal-rCM: A Unified Teacher-Forcing and Self-Forcing Open Recipe for Streaming Video Generation and Interactive World Models </h1>
 <h3 align="center"> 🚀State-of-the-Art JVP-Based Diffusion Distillation · Few-Step Video Generation · Scaling Up sCM/MeanFlow · Causal/Autoregressive Extension </h3>
 <h3 align="center"> 🚀A Leading, Unified and Scalable Open-Source Algorithm-and-Infrastructure Recipe for Diffusion Distillation and Causal Training </h3>
 <div align="center">
@@ -8,13 +8,11 @@
     <strong>ICLR 2026</strong>
   </p>
   </div>
-  <a href='https://arxiv.org/abs/2510.08431'><img src='https://img.shields.io/badge/Paper%20(arXiv)-2510.08431-red?logo=arxiv'></a>  &nbsp;
+  <a href='https://arxiv.org/abs/2510.08431'><img src='https://img.shields.io/badge/Paper%20(arXiv)-2510.08431-red?logo=arxiv'></a>  &nbsp; <a href='https://arxiv.org/abs/2606.25473'><img src='https://img.shields.io/badge/Paper%20(arXiv)-2606.25473-red?logo=arxiv'></a>  &nbsp;
   <a href='https://research.nvidia.com/labs/dir/rcm'><img src='https://img.shields.io/badge/Website-green?logo=homepage&logoColor=white'></a> &nbsp;
 </div>
 
 **Notice**: rCM now includes a ***causal/autoregressive training*** stack, showing how **teacher-forcing** (forward-divergence/offline) CM complements **self-forcing** (reverse-divergence/on-policy) DMD in autoregressive video diffusion distillation.
-
-*Paper coming soon...*
 
 <p align="center">
 <img src="assets/vbench.png" width=95%>
@@ -254,9 +252,9 @@ We thank the [Cosmos-Predict2](https://github.com/nvidia-cosmos/cosmos-predict2)
   year={2025}
 }
 @article{zheng2026causal,
-  title={Causal-rCM: Teacher-Forcing meets Self-Forcing in Autoregressive Diffusion Distillation for Streaming Video Generation and Interactive World Models},
-  author={Zheng, Kaiwen and He, Guande and Zhao, Min and Zhu, Hongzhou and Zhang, Jintao and Chen, Huayu and Chen, Jianfei and Lin, Chen-Hsuan and Liu, Ming-Yu and Zhu, Jun and Ma, Qianli},
-  journal={TODO},
+  title={Causal-rCM: A Unified Teacher-Forcing and Self-Forcing Open Recipe for Autoregressive Diffusion Distillation in Streaming Video Generation and Interactive World Models},
+  author={Zheng, Kaiwen and He, Guande and Zhao, Min and Zhang, Jintao and Chen, Huayu and Chen, Jianfei and Lin, Chen-Hsuan and Liu, Ming-Yu and Zhu, Jun and Ma, Qianli},
+  journal={arXiv preprint arXiv:2606.25473},
   year={2026}
 }
 ```
