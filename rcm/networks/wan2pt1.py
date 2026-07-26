@@ -710,7 +710,19 @@ class WanModel(nn.Module):
         else:
             query_freqs = gen(torch.Size([B, T, H, W, self.dim]), t_start=t_offset)
             if has_kv_cache:
-                if fast_infer:
+                if fast_infer or self.pyramid_kv_enabled:
+                    # `key_freqs` covers the whole cached prefix, so it costs
+                    # O(t_offset) and `_rope_cache` keys on t_offset -- one entry
+                    # per block, never evicted, total O(blocks**2). At 481 latent
+                    # frames that is 42.9 GiB, which is the entire memory excess
+                    # the pyramid arm was carrying.
+                    #
+                    # Neither path reads it. fast_infer rotates keys before
+                    # caching; Pyramid Forcing takes the `manages_kv_cache` branch
+                    # in `a2a_cp.py`, which never calls
+                    # `apply_rope(key, rope.key_freqs)` -- it re-rotates from each
+                    # cached token's own (t, y, x) instead. So this was allocating
+                    # 43 GiB and discarding it.
                     current_key_freqs = query_freqs
                     key_freqs = None
                 else:

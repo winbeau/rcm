@@ -18,7 +18,7 @@ import torch
 pytest.importorskip("flash_attn", reason="ragged path needs flash-attn")
 
 from rcm.utils.blockmask import AttnMaskSpec, BlockPattern, FlexOrSdpaLocalAttention  # noqa: E402
-from rcm.utils.kv_cache import AttnContext, KVCache, KVCacheMode  # noqa: E402
+from rcm.utils.kv_cache import AttnContext, CausalInferenceState, KVCache, KVCacheMode  # noqa: E402
 from rcm.utils.pyramid_attention import (  # noqa: E402
     PyramidLocalAttention,
     PyramidSpec,
@@ -190,6 +190,56 @@ def test_disabled_mode_falls_back():
     ref = fallback(q, k, v, attn_meta=AttnMaskSpec(mode="none"))
     got = module(q, k, v, attn_ctx=None, attn_meta=AttnMaskSpec(mode="none"))
     torch.testing.assert_close(ref, got)
+
+
+def test_rope_cache_does_not_grow_quadratically():
+    """`key_freqs` must stay None while pyramid KV is on.
+
+    `_compute_rope` keys `_rope_cache` on `t_offset` and never evicts, and the
+    non-fast_infer branch builds a `key_freqs` covering the whole cached prefix
+    -- O(t_offset) per entry, so O(blocks**2) overall. That was 42.9 GiB at 481
+    latent frames, the entire memory excess the pyramid arm carried, and none of
+    it is ever read: `manages_kv_cache` bypasses `apply_rope(key, key_freqs)`.
+
+    The bug is invisible in output (the tensors are discarded), so only a memory
+    assertion catches a regression.
+    """
+    from rcm.networks.wan2pt1 import WanModel
+
+    num_frames, height, width = 8, 6, 8
+    _, _, _, _, _, pattern, _ = _setup(num_frames, height, width, 1, seed=53)
+
+    net = WanModel(model_type="t2v", num_layers=1, dim=1536, ffn_dim=8960,
+                   num_heads=N_HEADS).to("cuda")
+    spec = retain_everything_spec(1, N_HEADS, HEAD_DIM, latent_h=height,
+                                  latent_w=width, max_frames=num_frames)
+    net.enable_pyramid_kv(spec)
+
+    # `t_offset` is derived from (pattern, block_cursor), so walk the cursor the
+    # way the rollout does rather than setting the offset directly.
+    for block_idx in range(num_frames):
+        state = CausalInferenceState(mode=KVCacheMode.APPEND, kv_caches=None,
+                                     pattern=pattern, block_cursor=block_idx,
+                                     fast_infer=False)
+        rope = net._compute_rope(1, 1, height, width, state,
+                                 AttnMaskSpec(mode="block_causal", pattern=pattern,
+                                              q_block_offset=block_idx),
+                                 use_fused=False)
+        assert rope.key_freqs is None, (
+            f"key_freqs allocated at block {block_idx}; it is never read under "
+            "pyramid KV and accumulates one growing entry per block"
+        )
+
+    # Same walk with pyramid off must still build key_freqs -- otherwise the
+    # guard is vacuous and would pass even if the branch were removed outright.
+    net.disable_pyramid_kv()
+    state = CausalInferenceState(mode=KVCacheMode.APPEND, kv_caches=None,
+                                 pattern=pattern, block_cursor=4, fast_infer=False)
+    rope = net._compute_rope(1, 1, height, width, state,
+                             AttnMaskSpec(mode="block_causal", pattern=pattern,
+                                          q_block_offset=4),
+                             use_fused=False)
+    assert rope.key_freqs is not None
 
 
 def test_real_strategies_produce_three_policy_types():

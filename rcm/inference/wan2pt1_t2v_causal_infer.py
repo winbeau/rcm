@@ -43,6 +43,9 @@ from rcm.utils.frame_attention import FrameAttentionObserver
 # which writes through KVCache.write_transient into a dense contiguous buffer.
 # Set False by --pyramid_kv_labels; PyramidLocalAttention raises if it is left on.
 _FAST_INFER = True
+
+# Allocator high-water mark measured over the DiT rollout only (see below).
+_SAMPLING_PEAK_BYTES = None
 from rcm.utils.model_utils import init_weights_on_device, load_state_dict, load_state_dict_from_dcp
 from rcm.utils.umt5 import clear_umt5_memory, get_umt5_embedding
 
@@ -877,10 +880,14 @@ if __name__ == "__main__":
         evt_vae_start = torch.cuda.Event(enable_timing=True)
         evt_vae_end = torch.cuda.Event(enable_timing=True)
 
+        # Reset just before the rollout so the umT5 load (freed above, but still
+        # the process high-water mark) does not mask a KV cache smaller than it.
+        torch.cuda.reset_peak_memory_stats()
         evt_dit_start.record()
         profile = {}
         samples = _run_sampling(profile=profile)
         evt_dit_end.record()
+        _SAMPLING_PEAK_BYTES = max(_SAMPLING_PEAK_BYTES or 0, torch.cuda.max_memory_allocated())
 
         evt_vae_start.record()
         video = tokenizer.decode(samples.float())
@@ -922,6 +929,19 @@ if __name__ == "__main__":
     log.success(f"  VAE decoding : {avg_vae:.1f} ms")
     log.success(f"  Total        : {avg_total:.1f} ms")
     log.success(f"  FPS          : {fps:.1f} ({args.num_frames} frames)")
+    # Reported because a KV-cache policy's headline claim is memory, and
+    # nvidia-smi sampling can miss the peak.
+    #
+    # Two numbers, because the whole-process high-water mark is misleading on
+    # short clips: loading the umT5 encoder peaks around 23 GiB and is freed
+    # before sampling, so any cache smaller than that is invisible under it.
+    # The sampling-window figure resets the counter just before the rollout and
+    # is the one that actually reflects the KV cache.
+    log.success(f"  Peak CUDA mem: {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB "
+                f"whole process (reserved {torch.cuda.max_memory_reserved() / 2**30:.2f} GiB)")
+    if _SAMPLING_PEAK_BYTES is not None:
+        log.success(f"  Peak sampling: {_SAMPLING_PEAK_BYTES / 2**30:.2f} GiB "
+                    f"(DiT rollout only, umT5 load excluded)")
 
     to_show = (1.0 + video.float().cpu().unsqueeze(0).clamp(-1, 1)) / 2.0
     save_image_or_video(rearrange(to_show, "n b c t h w -> c t (n h) (b w)"), args.save_path, fps=16)

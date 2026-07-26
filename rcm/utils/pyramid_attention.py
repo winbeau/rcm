@@ -19,15 +19,74 @@ Pyramid-Forcing's `wan/modules/attention/core.py::run_varlen` does.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
 from torch import nn
 
+# PYRAMID_MEM_TRACE=1 prints a per-block allocator breakdown for layer 0. Off by
+# default: it forces a sync-free read but still costs a print per sampled block.
+_MEM_TRACE = os.environ.get("PYRAMID_MEM_TRACE") == "1"
+_MEM_TRACE_EVERY = int(os.environ.get("PYRAMID_MEM_TRACE_EVERY", "40"))
+# PYRAMID_MEM_CENSUS=1 additionally walks every live CUDA tensor in the process
+# and prints the largest (shape, dtype) groups. The four-step breakdown showed
+# `enter` climbing ~0.099 GiB/block while all four steps stayed flat, so the
+# growth is held by something the breakdown never touches. A census does not
+# need to guess where.
+_MEM_CENSUS = os.environ.get("PYRAMID_MEM_CENSUS") == "1"
+
 from rcm.pyramidkv import AdaptiveKVCache, PyramidKVConfig, build_compositions
 from rcm.utils.kv_cache import AttnContext, KVCacheMode
 from rcm.utils.pyramid_rope import build_pyramidkv_freq_table
+
+
+_MEM_CENSUS_TOP = int(os.environ.get("PYRAMID_MEM_CENSUS_TOP", "40"))
+
+
+def cuda_tensor_census(top: int = _MEM_CENSUS_TOP) -> list[tuple[str, int, float]]:
+    """Every live CUDA tensor in the process, grouped by (shape, dtype).
+
+    Deduplicates by storage pointer, so a view and its base are counted once --
+    otherwise `dynamic_k[i]` (a view into `_dyn_store_k[i]`) would double-count
+    the whole cache.
+
+    The first version printed only the top 12, which summed to 7.44 GiB against
+    an `enter` of 10.58 -- the growth was in the 3.14 GiB tail, invisible.
+    A TOTAL and a REST row keep that from happening again: growth that hides in
+    the tail still shows up as a moving REST.
+
+    Returns ``(label, count, gib)`` sorted by size, with TOTAL and REST last.
+    """
+    import gc
+    from collections import defaultdict
+
+    groups: dict[str, list[int]] = defaultdict(list)
+    seen: set[int] = set()
+    for obj in gc.get_objects():
+        try:
+            if not torch.is_tensor(obj) or not obj.is_cuda:
+                continue
+            ptr = obj.untyped_storage().data_ptr()
+        except Exception:
+            continue
+        if ptr in seen:
+            continue
+        seen.add(ptr)
+        nbytes = obj.untyped_storage().nbytes()
+        groups[f"{tuple(obj.shape)}:{obj.dtype}".replace("torch.", "")].append(nbytes)
+
+    rows = [(label, len(sizes), sum(sizes) / 2 ** 30) for label, sizes in groups.items()]
+    rows.sort(key=lambda r: -r[2])
+    total_gib = sum(r[2] for r in rows)
+    total_n = sum(r[1] for r in rows)
+    head = rows[:top]
+    rest_gib = total_gib - sum(r[2] for r in head)
+    rest_n = total_n - sum(r[1] for r in head)
+    head.append((f"REST[{len(rows) - len(head)} groups]", rest_n, rest_gib))
+    head.append((f"TOTAL[{len(rows)} groups]", total_n, total_gib))
+    return head
 
 try:
     from flash_attn import flash_attn_varlen_func
@@ -363,6 +422,9 @@ class PyramidLocalAttention(nn.Module):
         # pyramidkv's clean/noisy double pass.
         update_mode = "clean" if attn_ctx.mode == KVCacheMode.APPEND else "default"
 
+        trace = _MEM_TRACE and attn_ctx.layer_idx == 0 and block_idx % _MEM_TRACE_EVERY == 0
+        m0 = torch.cuda.memory_allocated() if trace else 0
+
         cache.update(
             k,
             v,
@@ -370,10 +432,32 @@ class PyramidLocalAttention(nn.Module):
             grid_sizes=grid_sizes,
             cache_update_mode=update_mode,
         )
+        m1 = torch.cuda.memory_allocated() if trace else 0
 
         k_flat, v_flat, cu_seqlens_k, max_seqlen_k, pos = cache.get_flat_kv_and_pos()
+        m2 = torch.cuda.memory_allocated() if trace else 0
+
         k_flat = cache.apply_rope_to_flat_k(k_flat, pos, freqs=self._freq_table(k.device))
-        return ragged_attention(q, k_flat, v_flat, cu_seqlens_k, max_seqlen_k)
+        m3 = torch.cuda.memory_allocated() if trace else 0
+
+        out = ragged_attention(q, k_flat, v_flat, cu_seqlens_k, max_seqlen_k)
+
+        if trace:
+            m4 = torch.cuda.memory_allocated()
+            g = 2 ** 30
+            print(
+                f"MEMTRACE blk={block_idx:>4} mode={update_mode:<7} "
+                f"kv_tok={int(cu_seqlens_k[-1]):>8} maxk={int(max_seqlen_k):>6} "
+                f"| enter={m0/g:7.3f} update=+{(m1-m0)/g:7.3f} "
+                f"readout=+{(m2-m1)/g:7.3f} rope=+{(m3-m2)/g:7.3f} "
+                f"attn=+{(m4-m3)/g:7.3f} held={m4/g:7.3f}",
+                flush=True,
+            )
+            if _MEM_CENSUS and update_mode == "clean":
+                for label, n, gib in cuda_tensor_census():
+                    print(f"MEMCENSUS blk={block_idx:>4} {gib:8.3f} GiB  n={n:>7}  {label}",
+                          flush=True)
+        return out
 
     # -- helpers ------------------------------------------------------------
 
