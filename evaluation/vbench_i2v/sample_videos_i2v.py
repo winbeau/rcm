@@ -268,7 +268,7 @@ def sample_causal_i2v(
         noise_full = torch.cat([image_latent.new_zeros(B, C, 1, H, W), init_noise], dim=2)
         step_noises = []
         for _ in range(max_steps):
-            n = torch.randn_like(noise_full, dtype=torch.float32, generator=generator)
+            n = torch.randn(noise_full.shape, dtype=torch.float32, device=noise_full.device, generator=generator)
             step_noises.append(broadcast(n, cp_group) if cp_group is not None else n)
     else:
         step_counts = [len(t_steps) - 1] * (num_blocks - 1)
@@ -280,7 +280,7 @@ def sample_causal_i2v(
     image_context = image_latent.to(torch.float64)
     if context_from_last_step and context_from_last_step_start_chunk == 0:
         prefill_t = last_step_context_t(t_steps, t_steps_per_chunk).to(device=image_latent.device, dtype=torch.float64)
-        image_noise = torch.randn_like(image_latent, dtype=torch.float32, generator=generator)
+        image_noise = torch.randn(image_latent.shape, dtype=torch.float32, device=image_latent.device, generator=generator)
         if cp_group is not None:
             image_noise = broadcast(image_noise, cp_group)
         image_context = (1 - prefill_t) * image_context + prefill_t * image_noise.to(torch.float64)

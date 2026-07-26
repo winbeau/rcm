@@ -1534,7 +1534,7 @@ def causal_rollout_sampling(
     kv_uncond = net.allocate_kv_caches(max_len=runtime_uncond.cache_max_len(T * frame_tokens)) if use_cfg else None
 
     if not ode:
-        step_noises = [torch.randn_like(init_noise, dtype=torch.float32, generator=generator) for _ in range(len(t_steps) - 1)]
+        step_noises = [torch.randn(init_noise.shape, dtype=torch.float32, device=init_noise.device, generator=generator) for _ in range(len(t_steps) - 1)]
     else:
         step_noises = None
 

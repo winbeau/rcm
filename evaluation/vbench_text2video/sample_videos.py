@@ -283,7 +283,7 @@ def sample_causal(
         max_steps = max(step_counts)
         step_noises = []
         for _ in range(max_steps):
-            n = torch.randn_like(init_noise, dtype=torch.float32, generator=generator)
+            n = torch.randn(init_noise.shape, dtype=torch.float32, device=init_noise.device, generator=generator)
             step_noises.append(broadcast(n, cp_group) if cp_group is not None else n)
     else:
         step_counts = [len(t_steps) - 1] * num_blocks
