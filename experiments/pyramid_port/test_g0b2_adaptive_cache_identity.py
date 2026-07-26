@@ -16,25 +16,15 @@ themselves actually dropping frames.
 """
 from __future__ import annotations
 
-import os
-import sys
-from pathlib import Path
-
 import pytest
 import torch
 
-_DEFAULT_PF = Path(__file__).resolve().parents[3] / "Pyramid-Forcing"
-_PF_ROOT = Path(os.environ.get("PYRAMIDKV_ROOT", _DEFAULT_PF))
-if str(_PF_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PF_ROOT))
-
 pytest.importorskip("flash_attn", reason="ragged path needs flash-attn")
-pyramidkv = pytest.importorskip("pyramidkv")
 
 from rcm.utils.blockmask import AttnMaskSpec, BlockPattern, FlexOrSdpaLocalAttention  # noqa: E402
 
-from experiments.pyramid_port.ragged_attention import ragged_attention  # noqa: E402
-from experiments.pyramid_port.rope_bridge import build_pyramidkv_freq_table  # noqa: E402
+from rcm.utils.pyramid_attention import ragged_attention  # noqa: E402
+from rcm.utils.pyramid_rope import build_pyramidkv_freq_table  # noqa: E402
 from experiments.pyramid_port.test_g0b_plumbing_parity import _rotate_full, _setup, HEAD_DIM  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
@@ -51,7 +41,7 @@ def _retain_everything_cache(num_frames: int, frame_seqlen: int, layer_idx: int 
     head's window is the whole prefix. Any deviation from vanilla rCM then comes
     from the machinery, not from the policy.
     """
-    from pyramidkv import PyramidKVConfig, build_compositions
+    from rcm.pyramidkv import PyramidKVConfig, build_compositions
 
     capacity = num_frames * frame_seqlen * 4  # never binding
     config = PyramidKVConfig(
@@ -77,7 +67,7 @@ def _retain_everything_cache(num_frames: int, frame_seqlen: int, layer_idx: int 
     )
     config.policies = config.compositions
 
-    from pyramidkv import AdaptiveKVCache
+    from rcm.pyramidkv import AdaptiveKVCache
 
     # frame_seq_length is not an AdaptiveKVCache kwarg; the base class reads it
     # off the config, which is why it is set there.
@@ -178,7 +168,7 @@ def test_noisy_passes_do_not_corrupt_committed_state():
 
 def test_cache_positions_match_the_bridge_convention():
     """The cache's own `pos_3d` must equal what `build_pos_3d` produces."""
-    from experiments.pyramid_port.rope_bridge import build_pos_3d
+    from rcm.utils.pyramid_rope import build_pos_3d
 
     num_frames, height, width = 4, 6, 8
     dev, _, k, v, _, _, frame_tokens = _setup(num_frames, height, width, 1, seed=19)

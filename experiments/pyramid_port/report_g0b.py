@@ -9,7 +9,7 @@ the plumbing is exact and the tolerance is just kernel jitter.
 import torch
 
 from rcm.utils.blockmask import AttnMaskSpec, BlockPattern, FlexOrSdpaLocalAttention
-from experiments.pyramid_port.ragged_attention import pack_dense_kv, ragged_attention
+from rcm.utils.pyramid_attention import pack_dense_kv, ragged_attention
 from experiments.pyramid_port.test_g0b_plumbing_parity import _rotate_full, _setup, HEAD_DIM
 
 

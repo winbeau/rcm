@@ -2,7 +2,7 @@
 import sys
 import torch
 
-from experiments.pyramid_port.rope_bridge import build_pos_3d, build_pyramidkv_freq_table
+from rcm.utils.pyramid_rope import build_pos_3d, build_pyramidkv_freq_table
 from experiments.pyramid_port.test_g0_rope_parity import (
     HEAD_DIM,
     _max_abs_diff,

@@ -17,31 +17,21 @@ so a failure localizes to this glue rather than to the policy stack.
 """
 from __future__ import annotations
 
-import os
-import sys
-from pathlib import Path
-
 import pytest
 import torch
-
-_DEFAULT_PF = Path(__file__).resolve().parents[3] / "Pyramid-Forcing"
-_PF_ROOT = Path(os.environ.get("PYRAMIDKV_ROOT", _DEFAULT_PF))
-if str(_PF_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PF_ROOT))
 
 pytest.importorskip("flash_attn", reason="ragged path needs flash-attn")
 
 from rcm.networks.wan2pt1 import VideoRopePosition3DEmb  # noqa: E402
+from rcm.pyramidkv import rope as pyramidkv_rope  # noqa: E402
 from rcm.utils.blockmask import AttnMaskSpec, BlockPattern, FlexOrSdpaLocalAttention  # noqa: E402
 from rcm.utils.rope import apply_rope  # noqa: E402
 
-from experiments.pyramid_port.ragged_attention import pack_dense_kv, ragged_attention  # noqa: E402
-from experiments.pyramid_port.rope_bridge import (  # noqa: E402
+from rcm.utils.pyramid_attention import pack_dense_kv, ragged_attention  # noqa: E402
+from rcm.utils.pyramid_rope import (  # noqa: E402
     build_pos_3d,
     build_pyramidkv_freq_table,
 )
-
-pyramidkv_rope = pytest.importorskip("pyramidkv.rope")
 
 HEAD_DIM = 128
 N_HEADS = 12

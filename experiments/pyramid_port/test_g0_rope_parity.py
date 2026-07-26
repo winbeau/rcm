@@ -4,33 +4,18 @@ A mismatch here does not raise; it degrades video quality, which would be
 misread as the method failing on rCM. This is the gate that catches it before
 any quality number is produced.
 
-Needs `pyramidkv` importable — point `PYRAMIDKV_ROOT` at the Pyramid-Forcing
-checkout (default: the sibling submodule in the NeurIPS2026 super-repo).
-
     PYTHONPATH=. pytest experiments/pyramid_port/test_g0_rope_parity.py -q
 """
 from __future__ import annotations
 
-import os
-import sys
-from pathlib import Path
-
 import pytest
 import torch
 
-_DEFAULT_PF = Path(__file__).resolve().parents[3] / "Pyramid-Forcing"
-_PF_ROOT = Path(os.environ.get("PYRAMIDKV_ROOT", _DEFAULT_PF))
-if str(_PF_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PF_ROOT))
+from rcm.networks.wan2pt1 import VideoRopePosition3DEmb
+from rcm.pyramidkv import rope as pyramidkv_rope
+from rcm.utils.rope import apply_rope
 
-pyramidkv_rope = pytest.importorskip(
-    "pyramidkv.rope", reason=f"pyramidkv not importable from {_PF_ROOT}"
-)
-
-from rcm.networks.wan2pt1 import VideoRopePosition3DEmb  # noqa: E402
-from rcm.utils.rope import apply_rope  # noqa: E402
-
-from experiments.pyramid_port.rope_bridge import (  # noqa: E402
+from rcm.utils.pyramid_rope import (
     build_pos_3d,
     build_pyramidkv_freq_table,
 )

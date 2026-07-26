@@ -618,6 +618,48 @@ class WanModel(nn.Module):
     def get_spatial_patch_size(self):
         return self.patch_size[1] * self.patch_size[2]
 
+    @property
+    def pyramid_kv_enabled(self) -> bool:
+        return getattr(self, "_pyramid_spec", None) is not None
+
+    def enable_pyramid_kv(self, spec) -> None:
+        """Swap every layer's ``local_attn`` for the head-aware KV cache.
+
+        Uses the ``manages_kv_cache`` hook that ``DistributedAttention`` already
+        reads, so ``KVCache``, ``_materialize_kv`` and the attention op are
+        untouched. Also flips RoPE to pre-key caching (see ``_compute_rope``);
+        any RoPE state cached before this call is discarded.
+
+        The caller must additionally run with ``fast_infer=False`` --
+        ``PyramidLocalAttention`` raises otherwise, since ``write_transient``
+        assumes a dense contiguous cache.
+        """
+        from rcm.utils.pyramid_attention import PyramidLocalAttention
+
+        self._pyramid_spec = spec
+        self._rope_cache.clear()
+        for block in self.blocks:
+            attn_op = block.self_attn.attn_op
+            attn_op.local_attn = PyramidLocalAttention(spec, fallback=attn_op.local_attn)
+
+    def disable_pyramid_kv(self) -> None:
+        """Restore the stock local attention and post-RoPE key caching."""
+        if not self.pyramid_kv_enabled:
+            return
+        self._pyramid_spec = None
+        self._rope_cache.clear()
+        for block in self.blocks:
+            attn_op = block.self_attn.attn_op
+            if getattr(attn_op.local_attn, "manages_kv_cache", False):
+                attn_op.local_attn = attn_op.local_attn.fallback
+
+    def reset_pyramid_kv(self) -> None:
+        """Drop every layer's per-head cache. Call between clips."""
+        for block in self.blocks:
+            local_attn = block.self_attn.attn_op.local_attn
+            if getattr(local_attn, "manages_kv_cache", False):
+                local_attn.reset()
+
     def _compute_rope(
         self, B: int, T: int, H: int, W: int, inference_state: Optional[CausalInferenceState], attn_meta: Optional[AttnMaskSpec], use_fused: bool
     ) -> RopeCache:
@@ -683,7 +725,11 @@ class WanModel(nn.Module):
             key_freqs=key_freqs,
             current_key_freqs=current_key_freqs,
             use_fused=use_fused,
-            cached_k_rotated=True,
+            # Pyramid Forcing caches raw keys and re-rotates them at readout from
+            # each token's stored (t, y, x), which is what lets middle strategies
+            # remap anchor time. Post-RoPE caching would rotate the key before it
+            # ever reaches the cache and make that impossible.
+            cached_k_rotated=not self.pyramid_kv_enabled,
         )
         self._rope_cache[cache_key] = rope
         if inference_state is not None:

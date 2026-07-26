@@ -38,6 +38,11 @@ from rcm.tokenizers.wan2pt1 import Wan2pt1VAEInterface
 from rcm.utils.blockmask import AttnMaskSpec, BlockPattern
 from rcm.utils.kv_cache import CausalInferenceState, KVCacheMode
 from rcm.utils.frame_attention import FrameAttentionObserver
+
+# Pyramid Forcing's per-head cache is incompatible with the fast_infer path,
+# which writes through KVCache.write_transient into a dense contiguous buffer.
+# Set False by --pyramid_kv_labels; PyramidLocalAttention raises if it is left on.
+_FAST_INFER = True
 from rcm.utils.model_utils import init_weights_on_device, load_state_dict, load_state_dict_from_dcp
 from rcm.utils.umt5 import clear_umt5_memory, get_umt5_embedding
 
@@ -309,7 +314,7 @@ def causal_rollout_sampling(
             # shares one key length, so only step 0 -- the noisiest query -- landed.
             observe_here = attn_observer if (attn_capture_step == "denoise0" and step_idx == 0) else None
             inf_cond = CausalInferenceState(
-                mode=kv_mode, kv_caches=kv_cond, pattern=bp, block_cursor=i, fast_infer=True, attn_observer=observe_here
+                mode=kv_mode, kv_caches=kv_cond, pattern=bp, block_cursor=i, fast_infer=_FAST_INFER, attn_observer=observe_here
             )
 
             v_cond = net(
@@ -321,7 +326,7 @@ def causal_rollout_sampling(
             ).float()
 
             if use_cfg:
-                inf_uncond = CausalInferenceState(mode=kv_mode, kv_caches=kv_uncond, pattern=bp, block_cursor=i, fast_infer=True)
+                inf_uncond = CausalInferenceState(mode=kv_mode, kv_caches=kv_uncond, pattern=bp, block_cursor=i, fast_infer=_FAST_INFER)
                 v_uncond = net(
                     x_B_C_T_H_W=x.to(**TENSOR_KWARGS),
                     timesteps_B_T=t_cur_B_1,
@@ -346,12 +351,12 @@ def causal_rollout_sampling(
             # exactly one observation per chunk (the denoising forwards above
             # would fire once per step on progressively noisier inputs).
             inf_append_cond = CausalInferenceState(
-                mode=KVCacheMode.APPEND, kv_caches=kv_cond, pattern=bp, block_cursor=i, fast_infer=True,
+                mode=KVCacheMode.APPEND, kv_caches=kv_cond, pattern=bp, block_cursor=i, fast_infer=_FAST_INFER,
                 attn_observer=attn_observer if attn_capture_step == "append" else None
             )
             net(x_B_C_T_H_W=x.to(**TENSOR_KWARGS), timesteps_B_T=zero_t, **condition, inference_state=inf_append_cond, attn_meta=attn_meta)
             if use_cfg:
-                inf_append_uncond = CausalInferenceState(mode=KVCacheMode.APPEND, kv_caches=kv_uncond, pattern=bp, block_cursor=i, fast_infer=True)
+                inf_append_uncond = CausalInferenceState(mode=KVCacheMode.APPEND, kv_caches=kv_uncond, pattern=bp, block_cursor=i, fast_infer=_FAST_INFER)
                 net(x_B_C_T_H_W=x.to(**TENSOR_KWARGS), timesteps_B_T=zero_t, **uncondition, inference_state=inf_append_uncond, attn_meta=attn_meta)
 
         x_blocks.append(x)
@@ -426,10 +431,10 @@ def causal_i2v_rollout_sampling(
         image_context = (1 - prefill_t) * image_context + prefill_t * image_noise.to(torch.float64)
     prefill_t_B_1 = (prefill_t * ones_B_1 * RECTIFIED_FLOW_T_SCALING).to(**TENSOR_KWARGS)
 
-    inf_cond = CausalInferenceState(mode=KVCacheMode.APPEND, kv_caches=kv_cond, pattern=bp, block_cursor=0, fast_infer=True)
+    inf_cond = CausalInferenceState(mode=KVCacheMode.APPEND, kv_caches=kv_cond, pattern=bp, block_cursor=0, fast_infer=_FAST_INFER)
     net(x_B_C_T_H_W=image_context.to(**TENSOR_KWARGS), timesteps_B_T=prefill_t_B_1, **condition, inference_state=inf_cond, attn_meta=attn_meta_0)
     if use_cfg:
-        inf_uncond = CausalInferenceState(mode=KVCacheMode.APPEND, kv_caches=kv_uncond, pattern=bp, block_cursor=0, fast_infer=True)
+        inf_uncond = CausalInferenceState(mode=KVCacheMode.APPEND, kv_caches=kv_uncond, pattern=bp, block_cursor=0, fast_infer=_FAST_INFER)
         net(
             x_B_C_T_H_W=image_context.to(**TENSOR_KWARGS),
             timesteps_B_T=prefill_t_B_1,
@@ -455,7 +460,7 @@ def causal_i2v_rollout_sampling(
             t_cur_B_1 = (t_cur * ones_B_1 * RECTIFIED_FLOW_T_SCALING).to(**TENSOR_KWARGS)
             is_last = step_idx == num_steps - 1
             kv_mode = KVCacheMode.APPEND if (use_last_step_context and is_last) else KVCacheMode.READONLY
-            inf_cond = CausalInferenceState(mode=kv_mode, kv_caches=kv_cond, pattern=bp, block_cursor=i, fast_infer=True)
+            inf_cond = CausalInferenceState(mode=kv_mode, kv_caches=kv_cond, pattern=bp, block_cursor=i, fast_infer=_FAST_INFER)
 
             v_cond = net(
                 x_B_C_T_H_W=x.to(**TENSOR_KWARGS),
@@ -466,7 +471,7 @@ def causal_i2v_rollout_sampling(
             ).float()
 
             if use_cfg:
-                inf_uncond = CausalInferenceState(mode=kv_mode, kv_caches=kv_uncond, pattern=bp, block_cursor=i, fast_infer=True)
+                inf_uncond = CausalInferenceState(mode=kv_mode, kv_caches=kv_uncond, pattern=bp, block_cursor=i, fast_infer=_FAST_INFER)
                 v_uncond = net(
                     x_B_C_T_H_W=x.to(**TENSOR_KWARGS),
                     timesteps_B_T=t_cur_B_1,
@@ -486,10 +491,10 @@ def causal_i2v_rollout_sampling(
 
         if not use_last_step_context:
             zero_t = torch.zeros(B, 1, **TENSOR_KWARGS)
-            inf_append_cond = CausalInferenceState(mode=KVCacheMode.APPEND, kv_caches=kv_cond, pattern=bp, block_cursor=i, fast_infer=True)
+            inf_append_cond = CausalInferenceState(mode=KVCacheMode.APPEND, kv_caches=kv_cond, pattern=bp, block_cursor=i, fast_infer=_FAST_INFER)
             net(x_B_C_T_H_W=x.to(**TENSOR_KWARGS), timesteps_B_T=zero_t, **condition, inference_state=inf_append_cond, attn_meta=attn_meta)
             if use_cfg:
-                inf_append_uncond = CausalInferenceState(mode=KVCacheMode.APPEND, kv_caches=kv_uncond, pattern=bp, block_cursor=i, fast_infer=True)
+                inf_append_uncond = CausalInferenceState(mode=KVCacheMode.APPEND, kv_caches=kv_uncond, pattern=bp, block_cursor=i, fast_infer=_FAST_INFER)
                 net(x_B_C_T_H_W=x.to(**TENSOR_KWARGS), timesteps_B_T=zero_t, **uncondition, inference_state=inf_append_uncond, attn_meta=attn_meta)
 
         x_blocks.append(x)
@@ -539,6 +544,30 @@ def parse_arguments() -> argparse.Namespace:
         "--adaptive_resolution",
         action="store_true",
         help="For I2V, adapt output resolution to the input image aspect ratio while preserving the target pixel area.",
+    )
+    parser.add_argument(
+        "--pyramid_kv_labels",
+        type=str,
+        default="",
+        help="Path to a 30x12 Anchor/Wave/Veil label CSV. Enables the head-aware "
+        "KV cache (Pyramid Forcing) and turns off fast_infer, which is "
+        "incompatible with a per-head ragged cache.",
+    )
+    parser.add_argument("--pyramid_recent_frames", type=int, default=4)
+    parser.add_argument("--pyramid_osc_sink_frames", type=int, default=1)
+    parser.add_argument("--pyramid_stable_sink_frames", type=int, default=3)
+    parser.add_argument("--pyramid_cyclic_period", type=int, default=6)
+    parser.add_argument("--pyramid_stride_interval", type=int, default=6)
+    parser.add_argument(
+        "--pyramid_sink_time_clamp",
+        type=int,
+        nargs=2,
+        default=None,
+        metavar=("MIN", "MAX"),
+        help="Dynamic-RoPE window for re-timed anchors. The paper's 18/21 is "
+        "pinned to Self-Forcing's 21-frame training range; rCM's "
+        "VideoRopePosition3DEmb uses len_t=32, so the default here is derived "
+        "from that instead of copied. Omit to disable clamping.",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--save_path", type=str, default="output/causal_generated_video.mp4")
@@ -621,6 +650,46 @@ if __name__ == "__main__":
 
     load_dit_weights(net, args.dit_path)
     log.success(f"Loaded DiT from {args.dit_path}")
+
+    if args.pyramid_kv_labels:
+        from rcm.utils.pyramid_attention import PyramidSpec
+
+        _FAST_INFER = False
+        _w, _h = VIDEO_RES_SIZE_INFO[args.resolution][args.aspect_ratio]
+        _patch = net.patch_size  # (1, 2, 2)
+        latent_h = _h // 8 // _patch[1]
+        latent_w = _w // 8 // _patch[2]
+        clamp_min, clamp_max = (args.pyramid_sink_time_clamp or (0, 0))
+        pyramid_spec = PyramidSpec(
+            num_layers=len(net.blocks),
+            num_heads=net.num_heads,
+            head_dim=net.dim // net.num_heads,
+            latent_h=latent_h,
+            latent_w=latent_w,
+            labels_csv=args.pyramid_kv_labels,
+            # Only sizes the RoPE frequency table ([max_pos, 64] complex64, so
+            # 256 rows is ~128 KB); overshooting costs nothing.
+            max_frames=max(256, args.num_frames),
+            recent_frames=args.pyramid_recent_frames,
+            osc_sink_frames=args.pyramid_osc_sink_frames,
+            stable_sink_frames=args.pyramid_stable_sink_frames,
+            cyclic_period=args.pyramid_cyclic_period,
+            stride_interval=args.pyramid_stride_interval,
+            # Clamping is OFF by default. The paper's 18/21 encodes Self-Forcing's
+            # 21-latent-frame training range; rCM natively rolls out 72+ frames, so
+            # copying those numbers would re-time anchors into a window that has no
+            # meaning here. Whether rCM benefits from any clamp is an open question
+            # for G3, not something to guess at now.
+            sink_time_clamp_min=clamp_min,
+            sink_time_clamp_max=clamp_max,
+            sink_grid_decoupling=bool(args.pyramid_sink_time_clamp),
+        )
+        net.enable_pyramid_kv(pyramid_spec)
+        log.success(
+            f"Pyramid Forcing KV cache enabled from {args.pyramid_kv_labels}; "
+            f"grid {latent_h}x{latent_w}={latent_h * latent_w} tokens/frame, "
+            f"policies {pyramid_spec.composition_summary()}, fast_infer off"
+        )
 
     net.to(**TENSOR_KWARGS).cpu()
     torch.cuda.empty_cache()
