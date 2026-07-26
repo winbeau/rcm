@@ -572,6 +572,22 @@ def parse_arguments() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--attn_tag", type=str, default="", help="Optional suffix for the artifact filenames")
+    parser.add_argument(
+        "--attn_layout",
+        choices=["flat", "runs"],
+        default="flat",
+        help=(
+            "Artifact layout. 'flat' writes <dir>/layer<N><tag>.pt. 'runs' writes <dir>/run_<NNN>/layer<N>.pt, "
+            "which is what jupyter-plot's spectral_analysis_utils.compute_head_period_homology_256 globs -- it "
+            "requires that exact naming and ignores --attn_tag."
+        ),
+    )
+    parser.add_argument(
+        "--attn_run_index",
+        type=int,
+        default=0,
+        help="Run index for --attn_layout runs, i.e. the NNN in run_<NNN>. Use it to shard a prompt set across GPUs.",
+    )
 
     return parser.parse_args()
 
@@ -844,7 +860,11 @@ if __name__ == "__main__":
 
     # --- Persist frame-level attention ---
     if attn_observer is not None:
-        os.makedirs(args.attn_output_dir, exist_ok=True)
+        if args.attn_layout == "runs":
+            attn_dir = os.path.join(args.attn_output_dir, f"run_{args.attn_run_index:03d}")
+        else:
+            attn_dir = args.attn_output_dir
+        os.makedirs(attn_dir, exist_ok=True)
         expected_blocks = 1 + (T_latent - args.first_chunk_t) // args.chunk_t
         if not attn_observer.observed_blocks:
             raise RuntimeError(
@@ -852,15 +872,21 @@ if __name__ == "__main__":
             )
         if len(attn_observer.observed_blocks) != expected_blocks:
             log.warning(f"observed {len(attn_observer.observed_blocks)}/{expected_blocks} chunks; the matrix has unfilled rows")
+        if args.attn_layout == "runs" and T_latent < 69:
+            log.warning(
+                f"--attn_layout runs targets the spectral analysis, which slices last_block_frame_attention[0:69]; "
+                f"this run only has {T_latent} latent frames. Use --num_frames 285 (72 latent frames) or more."
+            )
         block_sizes = attn_observer.block_sizes(expected_blocks)
         last_block_q_start = sum(block_sizes[:-1])
         last_block_q_frames = list(range(last_block_q_start, T_latent))
-        tag = f"_{args.attn_tag}" if args.attn_tag else ""
+        # The spectral consumer globs a bare layer<N>.pt, so 'runs' drops the tag.
+        tag = "" if args.attn_layout == "runs" else (f"_{args.attn_tag}" if args.attn_tag else "")
 
         for layer_index in sorted(attn_observer.full):
             full_frame_attn = attn_observer.full[layer_index]
             last_block_frame_attn = full_frame_attn[:, last_block_q_start:T_latent, :].mean(dim=1)
-            out_path = os.path.join(args.attn_output_dir, f"layer{layer_index}{tag}.pt")
+            out_path = os.path.join(attn_dir, f"layer{layer_index}{tag}.pt")
             torch.save(
                 {
                     # --- schema consumed by the analysis notebooks ---
@@ -897,4 +923,4 @@ if __name__ == "__main__":
                 },
                 out_path,
             )
-        log.success(f"Saved {len(attn_observer.full)} attention artifact(s) to {args.attn_output_dir}/")
+        log.success(f"Saved {len(attn_observer.full)} attention artifact(s) to {attn_dir}/")
