@@ -69,6 +69,37 @@ rCM achieves both **high quality** and **strong diversity**.
 <video src="https://github.com/user-attachments/assets/b1e3b786-134b-429d-b859-840646502c9b" controls></video>
 
 ## Environment Setup
+
+### Option A — `uv` (this fork; inference + attention extraction)
+
+This fork adds a `pyproject.toml` / `uv.lock` so the inference environment is
+reproducible without a source build. Every wheel is prebuilt:
+
+```bash
+uv sync                        # core inference deps
+uv sync --extra notebook       # + jupyter / plotting for attention analysis
+uv sync --extra all            # everything except the source-built extras
+
+PYTHONPATH=. uv run --no-sync python -m rcm.inference.wan2pt1_t2v_causal_infer --help
+```
+
+Pinning notes:
+
+- **`flash-attn` is pinned to an exact release wheel**, not resolved:
+  `flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl`.
+  Upstream builds FA2 from source at `v2.7.4.post1`; no prebuilt cp312 wheel
+  exists past `torch2.10`, so this fork holds **torch at 2.9.1+cu126** to
+  consume the official wheel instead of compiling. On Hopper,
+  `rcm/utils/attention.py` dispatches to cuDNN/FlashAttention SDPA when FA3
+  (`flash_attn_interface`) is absent, so no FA3 source build is required.
+- `megatron-core`, `wandb` and `webdataset` are **not** core deps — they are
+  only imported from `rcm/models/`, `rcm/trainers/` and `rcm/callbacks/`, none
+  of which the causal T2V inference path reaches. Install them with
+  `uv sync --extra train`. `transformer-engine` still needs
+  `pip install --no-build-isolation transformer_engine[pytorch]` for training.
+
+### Option B — conda (upstream instructions)
+
 Our training and inference are based on native PyTorch, completely free from `accelerate` and `diffusers`.
 
 ```bash

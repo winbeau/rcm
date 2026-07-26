@@ -1,0 +1,123 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rcm"
+version = "0.1.0"
+description = "rCM / Causal-rCM: score-regularized continuous-time consistency models for streaming video generation"
+readme = "README.md"
+# Upstream README pins conda python==3.12.12. Stay inside 3.12 so the
+# pinned flash-attn cp312 wheel below always matches the interpreter.
+requires-python = ">=3.12,<3.13"
+
+# Core inference dependencies. Scope = everything reachable from
+# `rcm/inference/wan2pt1_t2v_causal_infer.py` (the Causal-rCM T2V path),
+# resolved by a static import walk over the 33 modules it pulls in.
+# Training-only heavyweights (megatron-core, transformer-engine, wandb,
+# webdataset) live under [project.optional-dependencies] instead — they are
+# only imported from rcm/models/, rcm/trainers/ and rcm/callbacks/.
+dependencies = [
+    "attrs>=24.2.0",
+    "cloudpickle>=3.1.0",
+    "dill>=0.3.8",
+    "einops>=0.8.1",
+    # Pinned, never resolved. Upstream builds FA2 from source at
+    # v2.7.4.post1; there is no prebuilt cp312 wheel past torch2.10, so we
+    # hold torch at 2.9.1 and consume the official v2.8.3 release wheel.
+    # torch 2.9 ships cxx11 ABI = TRUE, hence the abiTRUE variant.
+    "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
+    "ftfy>=6.3.1",
+    "fvcore>=0.1.5.post20221221",
+    "huggingface-hub>=0.36.0",
+    "hydra-core>=1.3.2",
+    "imageio>=2.37.0",
+    "imageio-ffmpeg>=0.6.0",
+    "iopath>=0.1.10",
+    "loguru>=0.7.3",
+    "matplotlib>=3.10.0",
+    "numpy>=1.26.4,<2.3",
+    "nvidia-ml-py>=12.560.30",
+    "omegaconf>=2.3.0",
+    "opencv-python>=4.9.0.80",
+    "pandas>=2.2.3",
+    "pillow>=11.0.0",
+    "psutil>=6.1.0",
+    "pyyaml>=6.0.2",
+    "regex>=2024.0",
+    "safetensors>=0.4.5",
+    # Triton's runtime build path imports `setuptools`; uv-managed venvs
+    # don't ship it by default, so pin it here.
+    "setuptools>=68.0",
+    "termcolor>=2.5.0",
+    "torch==2.9.1",
+    "torchvision==0.24.1",
+    "tqdm>=4.67.1",
+    "transformers>=4.49.0",
+]
+
+[project.optional-dependencies]
+# Distillation / causal training stack (research-only path). megatron-core
+# and transformer-engine are module-level imports in rcm/models/ and
+# imaginaire/utils/graph.py; transformer-engine needs a source build
+# (`--no-build-isolation`), which is why it is not in the core set.
+train = [
+    "megatron-core>=0.9.0",
+    "wandb>=0.23.1",
+    "webdataset>=0.2.100",
+]
+
+# Test runner and formatters. Use `uv sync --extra dev` to install.
+dev = [
+    "pytest>=9.0.2",
+    "black>=25.12.0",
+    "isort>=7.0.0",
+]
+
+# Jupyter notebooks and offline analysis tooling. Attention-pattern
+# extraction artifacts are consumed from notebooks in winbeau/jupyter-plot.
+notebook = [
+    "jupyter>=1.1.1",
+    "ipykernel>=7.1.0",
+    "seaborn>=0.13.2",
+    "nvitop>=1.6.2",
+]
+
+# Convenience meta-extra: everything except the source-built extras.
+all = [
+    "rcm[train,dev,notebook]",
+]
+
+[tool.uv]
+# Constrain dependency resolution to Linux x86_64, where the flash-attn
+# wheel and the torch+cu126 wheels are available.
+environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+# PyTorch wheel index (CUDA 12.6, matching upstream's README). Marked
+# explicit so it only resolves the packages routed through it below.
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+torchvision = { index = "pytorch" }
+
+[tool.hatch.build.targets.wheel]
+packages = ["rcm", "imaginaire"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers"
+# Upstream is run as `PYTHONPATH=. python -m rcm.inference...`; keep the
+# repo root importable so tests resolve `rcm.*` / `imaginaire.*` the same way.
+pythonpath = ["."]
+markers = [
+    "gpu: tests that require a CUDA GPU",
+    "slow: tests that take more than a few seconds (use --run-slow to include)",
+]
