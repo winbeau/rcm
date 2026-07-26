@@ -261,6 +261,7 @@ def causal_rollout_sampling(
     context_from_last_step_start_chunk: int = 0,
     profile: dict | None = None,
     attn_observer: object | None = None,
+    attn_capture_step: str = "append",
 ) -> torch.Tensor:
     if context_from_last_step_start_chunk < 0:
         raise ValueError(f"context_from_last_step_start_chunk must be non-negative, got {context_from_last_step_start_chunk}")
@@ -303,7 +304,13 @@ def causal_rollout_sampling(
             t_cur_B_1 = (t_cur * ones_B_1 * RECTIFIED_FLOW_T_SCALING).to(**TENSOR_KWARGS)
             is_last = step_idx == num_steps - 1
             kv_mode = KVCacheMode.APPEND if (use_last_step_context and is_last) else KVCacheMode.READONLY
-            inf_cond = CausalInferenceState(mode=kv_mode, kv_caches=kv_cond, pattern=bp, block_cursor=i, fast_infer=True)
+            # "denoise0" reproduces what AdaHead's extractor actually recorded: its
+            # aggregator keys on the key length growing, and every step of a chunk
+            # shares one key length, so only step 0 -- the noisiest query -- landed.
+            observe_here = attn_observer if (attn_capture_step == "denoise0" and step_idx == 0) else None
+            inf_cond = CausalInferenceState(
+                mode=kv_mode, kv_caches=kv_cond, pattern=bp, block_cursor=i, fast_infer=True, attn_observer=observe_here
+            )
 
             v_cond = net(
                 x_B_C_T_H_W=x.to(**TENSOR_KWARGS),
@@ -339,7 +346,8 @@ def causal_rollout_sampling(
             # exactly one observation per chunk (the denoising forwards above
             # would fire once per step on progressively noisier inputs).
             inf_append_cond = CausalInferenceState(
-                mode=KVCacheMode.APPEND, kv_caches=kv_cond, pattern=bp, block_cursor=i, fast_infer=True, attn_observer=attn_observer
+                mode=KVCacheMode.APPEND, kv_caches=kv_cond, pattern=bp, block_cursor=i, fast_infer=True,
+                attn_observer=attn_observer if attn_capture_step == "append" else None
             )
             net(x_B_C_T_H_W=x.to(**TENSOR_KWARGS), timesteps_B_T=zero_t, **condition, inference_state=inf_append_cond, attn_meta=attn_meta)
             if use_cfg:
@@ -553,6 +561,16 @@ def parse_arguments() -> argparse.Namespace:
         help="pooled = mean-pool each frame's tokens then contract (exact and ~1e6x cheaper); naive = materialize token-level scores",
     )
     parser.add_argument("--attn_verify", action="store_true", help="Check the pooled fast path against the naive reference on one observation")
+    parser.add_argument(
+        "--attn_capture_step",
+        choices=["append", "denoise0"],
+        default="append",
+        help=(
+            "Which forward to observe. 'append' = the once-per-chunk KV-append pass at t=0 (clean query, clean key). "
+            "'denoise0' = the first denoising step (noisy query, clean key), which is what AdaHead's extractor "
+            "actually recorded -- use it when comparing logit magnitudes against the Self-Forcing artifacts."
+        ),
+    )
     parser.add_argument("--attn_tag", type=str, default="", help="Optional suffix for the artifact filenames")
 
     return parser.parse_args()
@@ -685,6 +703,11 @@ if __name__ == "__main__":
             raise ValueError("--extract_attn_layers is only wired for the T2V causal path")
         if args.warmup_iters != 0 or args.num_runs != 1:
             raise ValueError("attention extraction needs exactly one sampling pass: use --warmup_iters 0 --num_runs 1")
+        if args.attn_capture_step == "append" and args.context_from_last_step:
+            raise ValueError(
+                "--context_from_last_step replaces the KV-append pass, so --attn_capture_step append would never "
+                "fire and would silently write an all-zero matrix. Use --attn_capture_step denoise0 instead."
+            )
         num_layers = len(net.blocks)
         if args.extract_attn_layers.strip() == "all":
             layer_indices = list(range(num_layers))
@@ -747,6 +770,7 @@ if __name__ == "__main__":
             context_from_last_step_start_chunk=args.context_from_last_step_start_chunk,
             profile=profile,
             attn_observer=attn_observer,
+            attn_capture_step=args.attn_capture_step,
         )
 
     # --- Warmup ---
@@ -822,6 +846,10 @@ if __name__ == "__main__":
     if attn_observer is not None:
         os.makedirs(args.attn_output_dir, exist_ok=True)
         expected_blocks = 1 + (T_latent - args.first_chunk_t) // args.chunk_t
+        if not attn_observer.observed_blocks:
+            raise RuntimeError(
+                f"the observer never fired with --attn_capture_step {args.attn_capture_step}; refusing to write an all-zero matrix"
+            )
         if len(attn_observer.observed_blocks) != expected_blocks:
             log.warning(f"observed {len(attn_observer.observed_blocks)}/{expected_blocks} chunks; the matrix has unfilled rows")
         block_sizes = attn_observer.block_sizes(expected_blocks)
@@ -860,7 +888,12 @@ if __name__ == "__main__":
                     "seed": args.seed,
                     "resolution": args.resolution,
                     "aspect_ratio": args.aspect_ratio,
-                    "capture_pass": "kv-append (t=0, clean context), once per chunk",
+                    "capture_pass": (
+                        "kv-append (t=0, clean query x clean key), once per chunk"
+                        if args.attn_capture_step == "append"
+                        else "denoise step 0 (noisy query x clean key), once per chunk -- AdaHead-comparable"
+                    ),
+                    "attn_capture_step": args.attn_capture_step,
                 },
                 out_path,
             )
