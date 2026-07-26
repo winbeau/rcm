@@ -37,6 +37,7 @@ from rcm.networks.wan2pt1 import WanModel
 from rcm.tokenizers.wan2pt1 import Wan2pt1VAEInterface
 from rcm.utils.blockmask import AttnMaskSpec, BlockPattern
 from rcm.utils.kv_cache import CausalInferenceState, KVCacheMode
+from rcm.utils.frame_attention import FrameAttentionObserver
 from rcm.utils.model_utils import init_weights_on_device, load_state_dict, load_state_dict_from_dcp
 from rcm.utils.umt5 import clear_umt5_memory, get_umt5_embedding
 
@@ -259,6 +260,7 @@ def causal_rollout_sampling(
     context_from_last_step: bool = False,
     context_from_last_step_start_chunk: int = 0,
     profile: dict | None = None,
+    attn_observer: object | None = None,
 ) -> torch.Tensor:
     if context_from_last_step_start_chunk < 0:
         raise ValueError(f"context_from_last_step_start_chunk must be non-negative, got {context_from_last_step_start_chunk}")
@@ -332,7 +334,13 @@ def causal_rollout_sampling(
 
         if not use_last_step_context:
             zero_t = torch.zeros(B, 1, **TENSOR_KWARGS)
-            inf_append_cond = CausalInferenceState(mode=KVCacheMode.APPEND, kv_caches=kv_cond, pattern=bp, block_cursor=i, fast_infer=True)
+            # The observer is attached only to this pass: it runs once per chunk
+            # at t=0 on the denoised latent, so it sees clean context and yields
+            # exactly one observation per chunk (the denoising forwards above
+            # would fire once per step on progressively noisier inputs).
+            inf_append_cond = CausalInferenceState(
+                mode=KVCacheMode.APPEND, kv_caches=kv_cond, pattern=bp, block_cursor=i, fast_infer=True, attn_observer=attn_observer
+            )
             net(x_B_C_T_H_W=x.to(**TENSOR_KWARGS), timesteps_B_T=zero_t, **condition, inference_state=inf_append_cond, attn_meta=attn_meta)
             if use_cfg:
                 inf_append_uncond = CausalInferenceState(mode=KVCacheMode.APPEND, kv_caches=kv_uncond, pattern=bp, block_cursor=i, fast_infer=True)
@@ -530,6 +538,23 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--context_from_last_step_start_chunk", type=int, default=0, help="First causal chunk index to use --context_from_last_step")
     parser.add_argument("--warmup_iters", type=int, default=0, help="Number of warmup runs before timed run")
     parser.add_argument("--num_runs", type=int, default=1, help="Number of timed runs to average")
+    # --- Frame-level attention extraction ---
+    parser.add_argument(
+        "--extract_attn_layers",
+        type=str,
+        default="",
+        help="Comma-separated DiT layer indices to capture frame-level attention for, or 'all'. Empty disables extraction.",
+    )
+    parser.add_argument("--attn_output_dir", type=str, default="cache/attn", help="Directory for the per-layer attention .pt artifacts")
+    parser.add_argument(
+        "--attn_method",
+        choices=["pooled", "naive"],
+        default="pooled",
+        help="pooled = mean-pool each frame's tokens then contract (exact and ~1e6x cheaper); naive = materialize token-level scores",
+    )
+    parser.add_argument("--attn_verify", action="store_true", help="Check the pooled fast path against the naive reference on one observation")
+    parser.add_argument("--attn_tag", type=str, default="", help="Optional suffix for the artifact filenames")
+
     return parser.parse_args()
 
 
@@ -653,6 +678,36 @@ if __name__ == "__main__":
     # --- Sample ---
     net.cuda()
 
+    # --- Frame-level attention observer ---
+    attn_observer = None
+    if args.extract_attn_layers:
+        if is_i2v:
+            raise ValueError("--extract_attn_layers is only wired for the T2V causal path")
+        if args.warmup_iters != 0 or args.num_runs != 1:
+            raise ValueError("attention extraction needs exactly one sampling pass: use --warmup_iters 0 --num_runs 1")
+        num_layers = len(net.blocks)
+        if args.extract_attn_layers.strip() == "all":
+            layer_indices = list(range(num_layers))
+        else:
+            layer_indices = [int(v) for v in args.extract_attn_layers.split(",") if v.strip() != ""]
+        for layer in layer_indices:
+            if not 0 <= layer < num_layers:
+                raise ValueError(f"layer index {layer} out of range for a {num_layers}-layer model")
+        frame_tokens_ext = state_shape[2] * state_shape[3] // net.get_spatial_patch_size()
+        attn_observer = FrameAttentionObserver(
+            layer_indices=layer_indices,
+            frame_tokens=frame_tokens_ext,
+            num_heads=net.num_heads,
+            num_frames=T_latent,
+            first_chunk_frames=args.first_chunk_t,
+            chunk_frames=args.chunk_t,
+            method=args.attn_method,
+        )
+        log.info(
+            f"Attention extraction: layers={layer_indices} heads={net.num_heads} "
+            f"frames={T_latent} frame_tokens={frame_tokens_ext} method={args.attn_method}"
+        )
+
     def _run_sampling(profile: dict | None = None):
         g = torch.Generator(device=TENSOR_KWARGS["device"])
         g.manual_seed(args.seed)
@@ -691,6 +746,7 @@ if __name__ == "__main__":
             context_from_last_step=args.context_from_last_step,
             context_from_last_step_start_chunk=args.context_from_last_step_start_chunk,
             profile=profile,
+            attn_observer=attn_observer,
         )
 
     # --- Warmup ---
@@ -761,3 +817,51 @@ if __name__ == "__main__":
     to_show = (1.0 + video.float().cpu().unsqueeze(0).clamp(-1, 1)) / 2.0
     save_image_or_video(rearrange(to_show, "n b c t h w -> c t (n h) (b w)"), args.save_path, fps=16)
     log.success(f"Saved to {args.save_path}")
+
+    # --- Persist frame-level attention ---
+    if attn_observer is not None:
+        os.makedirs(args.attn_output_dir, exist_ok=True)
+        expected_blocks = 1 + (T_latent - args.first_chunk_t) // args.chunk_t
+        if len(attn_observer.observed_blocks) != expected_blocks:
+            log.warning(f"observed {len(attn_observer.observed_blocks)}/{expected_blocks} chunks; the matrix has unfilled rows")
+        block_sizes = attn_observer.block_sizes(expected_blocks)
+        last_block_q_start = sum(block_sizes[:-1])
+        last_block_q_frames = list(range(last_block_q_start, T_latent))
+        tag = f"_{args.attn_tag}" if args.attn_tag else ""
+
+        for layer_index in sorted(attn_observer.full):
+            full_frame_attn = attn_observer.full[layer_index]
+            last_block_frame_attn = full_frame_attn[:, last_block_q_start:T_latent, :].mean(dim=1)
+            out_path = os.path.join(args.attn_output_dir, f"layer{layer_index}{tag}.pt")
+            torch.save(
+                {
+                    # --- schema consumed by the analysis notebooks ---
+                    "layer_index": layer_index,
+                    "full_frame_attention": full_frame_attn.to(torch.float16),
+                    "last_block_frame_attention": last_block_frame_attn.to(torch.float16),
+                    "is_logits": True,
+                    "prompt": args.prompt,
+                    "num_frames": T_latent,
+                    "frame_seq_length": attn_observer.frame_tokens,
+                    "num_frame_per_block": args.chunk_t,
+                    "num_heads": attn_observer.num_heads,
+                    "block_sizes": block_sizes,
+                    "query_frames": list(range(T_latent)),
+                    "key_frames": list(range(T_latent)),
+                    "last_block_query_frames": last_block_q_frames,
+                    "extraction_method": f"rcm-observer-{args.attn_method}",
+                    "chunk_frames": args.chunk_t,
+                    # --- rcm-specific provenance ---
+                    "model": f"Causal-rCM Wan2.1 T2V {args.model_size}",
+                    "dit_path": args.dit_path,
+                    "first_chunk_t": args.first_chunk_t,
+                    "chunk_t": args.chunk_t,
+                    "num_steps": args.num_steps,
+                    "seed": args.seed,
+                    "resolution": args.resolution,
+                    "aspect_ratio": args.aspect_ratio,
+                    "capture_pass": "kv-append (t=0, clean context), once per chunk",
+                },
+                out_path,
+            )
+        log.success(f"Saved {len(attn_observer.full)} attention artifact(s) to {args.attn_output_dir}/")

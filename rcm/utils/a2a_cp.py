@@ -190,7 +190,11 @@ class DistributedAttention(torch.nn.Module):
         if attn_ctx is None or attn_ctx.attn_observer is None:
             return
         cached_len = key.shape[1] - key_current.shape[1]
-        if cached_len <= 0:
+        # cached_len == 0 is the first chunk, which has no history yet. Observers
+        # that only care about cached tokens (DeepForcingTokenCollector) skip it
+        # themselves; observers that summarize the full key -- e.g. frame-level
+        # attention -- still need it, otherwise the first chunk's row is missing.
+        if cached_len < 0:
             return
         attn_ctx.attn_observer.observe(
             layer_idx=attn_ctx.layer_idx,
