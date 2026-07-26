@@ -21,6 +21,13 @@ CAPTURE_STEP=${5:-append}
 
 CKPT=${CKPT:-assets/checkpoints/Causal_rCM_Wan2.1_T2V_1.3B_480p_TF-dCM-init_SF-DMD_c1-1_step4.pt}
 SEED=${SEED:-0}
+# Latent frames per chunk. Must match how the checkpoint was distilled: the
+# c1-1 weights want 1/1, the c3-3 weights want 3/3. Setting 3/3 also makes
+# block_sizes [3]*24, matching Self-Forcing's num_frame_per_block=3 so that
+# last_block_frame_attention averages the same number of query rows on both
+# sides -- otherwise the field has the same name and a different meaning.
+FIRST_CHUNK_T=${FIRST_CHUNK_T:-1}
+CHUNK_T=${CHUNK_T:-1}
 
 # The spectral consumer slices last_block_frame_attention[0:69].
 if [[ "$LATENT_FRAMES" -lt 69 ]]; then
@@ -30,13 +37,18 @@ fi
 # latent T = 1 + (pixel_frames - 1) / 4
 PIXEL_FRAMES=$(( 4 * (LATENT_FRAMES - 1) + 1 ))
 
+if (( (LATENT_FRAMES - FIRST_CHUNK_T) % CHUNK_T != 0 )); then
+    echo "error: (latent_frames - first_chunk_t) must be divisible by chunk_t; got ($LATENT_FRAMES - $FIRST_CHUNK_T) % $CHUNK_T" >&2
+    exit 1
+fi
+
 IFS=',' read -r -a GPU_ARR <<< "$GPUS"
 NGPU=${#GPU_ARR[@]}
 mapfile -t PROMPT_LINES < "$PROMPTS"
 NPROMPT=${#PROMPT_LINES[@]}
 
 mkdir -p "$OUT_ROOT" "$OUT_ROOT/videos" logs
-echo "prompts=$NPROMPT  gpus=${GPU_ARR[*]}  latent_frames=$LATENT_FRAMES (=$PIXEL_FRAMES pixel)  capture=$CAPTURE_STEP"
+echo "prompts=$NPROMPT  gpus=${GPU_ARR[*]}  latent_frames=$LATENT_FRAMES (=$PIXEL_FRAMES pixel)  capture=$CAPTURE_STEP  chunks=$FIRST_CHUNK_T/$CHUNK_T"
 echo "out=$OUT_ROOT/run_000 .. run_$(printf '%03d' $((NPROMPT - 1)))"
 
 shard() {                       # $1 = position in GPU_ARR
@@ -50,7 +62,7 @@ shard() {                       # $1 = position in GPU_ARR
             rcm/inference/wan2pt1_t2v_causal_infer.py \
             --distilled --dit_path "$CKPT" \
             --num_steps 4 --mid_t 15/16 5/6 5/8 \
-            --first_chunk_t 1 --chunk_t 1 \
+            --first_chunk_t "$FIRST_CHUNK_T" --chunk_t "$CHUNK_T" \
             --num_frames "$PIXEL_FRAMES" --seed "$SEED" \
             --prompt "${PROMPT_LINES[$i]}" \
             --save_path "$OUT_ROOT/videos/$(printf 'run_%03d' "$i").mp4" \
