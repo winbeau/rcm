@@ -31,6 +31,12 @@ from pathlib import Path
 
 import torch
 
+from rcm.utils.attention_artifact import (
+    sha256_file,
+    validate_run_directory,
+    write_json,
+)
+
 
 def adapt_payload(payload: dict, pooling: str) -> dict:
     """Return a copy with `last_frame_attention_per_head` added."""
@@ -88,13 +94,41 @@ def main():
 
     n_files = 0
     for run in runs:
+        source_manifest = run / "run.json"
+        metadata = validate_run_directory(source_manifest)
         out_run = dst / run.name
         out_run.mkdir(parents=True, exist_ok=True)
-        for pt in sorted(run.glob("layer*.pt")):
+        output_artifacts = []
+        source_query_frames = {}
+        for artifact in metadata["artifacts"]:
+            pt = run / artifact["path"]
             payload = torch.load(pt, map_location="cpu", weights_only=False)
-            torch.save(adapt_payload(payload, args.pooling), out_run / pt.name)
+            out_path = out_run / pt.name
+            adapted = adapt_payload(payload, args.pooling)
+            torch.save(adapted, out_path)
+            output_artifacts.append(
+                {
+                    **artifact,
+                    "path": out_path.name,
+                    "sha256": sha256_file(out_path),
+                }
+            )
+            source_query_frames[str(artifact["layer_index"])] = adapted[
+                "last_frame_source_query_frames"
+            ]
             n_files += 1
-        print(f"  {run.name}: {len(list(out_run.glob('layer*.pt')))} layers", flush=True)
+
+        output_metadata = dict(metadata)
+        output_metadata["artifacts"] = output_artifacts
+        output_metadata["classifier_adapter"] = {
+            "pooling": args.pooling,
+            "source_manifest": str(source_manifest.resolve()),
+            "source_manifest_sha256": sha256_file(source_manifest),
+            "source_query_frames": source_query_frames,
+        }
+        write_json(out_run / "run.json", output_metadata)
+        validate_run_directory(out_run / "run.json")
+        print(f"  {run.name}: {len(output_artifacts)} layers", flush=True)
 
     print(f"\nadapted {n_files} artifacts across {len(runs)} runs -> {dst}")
     print(f"pooling = {args.pooling}")

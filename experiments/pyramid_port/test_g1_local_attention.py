@@ -24,6 +24,7 @@ from rcm.utils.pyramid_attention import (  # noqa: E402
     PyramidSpec,
     retain_everything_spec,
 )
+from rcm.utils.retained_k import RetainedKTelemetry  # noqa: E402
 from rcm.utils.rope import RopeCache  # noqa: E402
 
 from experiments.pyramid_port.test_g0b_plumbing_parity import _rotate_full, _setup, HEAD_DIM  # noqa: E402
@@ -33,13 +34,28 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUD
 N_HEADS = 12
 
 
-def _ctx(mode, block_idx, kv_cache, *, cached_k_rotated=False, fast_infer=False):
+def _ctx(
+    mode,
+    block_idx,
+    kv_cache,
+    *,
+    cached_k_rotated=False,
+    fast_infer=False,
+    retained_k_observer=None,
+    pass_name="",
+    denoise_step=-1,
+    stream_name="cond",
+):
     return AttnContext(
         mode=mode,
         kv_cache=kv_cache,
         block_range=block_idx,
         layer_idx=0,
         q_block_idx=block_idx,
+        retained_k_observer=retained_k_observer,
+        pass_name=pass_name,
+        denoise_step=denoise_step,
+        stream_name=stream_name,
         rope=RopeCache(cached_k_rotated=cached_k_rotated),
         fast_infer=fast_infer,
     )
@@ -128,6 +144,97 @@ def test_cfg_streams_do_not_share_a_cache():
         )
 
     torch.testing.assert_close(alone, interleaved)
+
+
+def test_retained_k_telemetry_records_pass_mode_and_cfg_stream():
+    """The module must report the ragged readout it actually gives FlashAttention."""
+    num_frames, height, width = 2, 6, 8
+    dev, q, k, v, emb, pattern, frame_tokens = _setup(
+        num_frames, height, width, 1, seed=30
+    )
+    q_rot = _rotate_full(emb, q, num_frames, height, width)
+    module = PyramidLocalAttention(
+        retain_everything_spec(1, N_HEADS, HEAD_DIM, height, width, num_frames)
+    ).to(dev)
+    telemetry = RetainedKTelemetry()
+    cache_cond, cache_uncond = KVCache(max_len=1), KVCache(max_len=1)
+
+    meta0 = AttnMaskSpec(mode="block_causal", pattern=pattern, q_block_offset=0)
+    module(
+        q_rot[:, :frame_tokens],
+        k[:, :frame_tokens],
+        v[:, :frame_tokens],
+        attn_ctx=_ctx(
+            KVCacheMode.READONLY,
+            0,
+            cache_cond,
+            retained_k_observer=telemetry,
+            pass_name="denoise0",
+            denoise_step=0,
+            stream_name="cond",
+        ),
+        attn_meta=meta0,
+    )
+    module(
+        q_rot[:, :frame_tokens],
+        k[:, :frame_tokens],
+        v[:, :frame_tokens],
+        attn_ctx=_ctx(
+            KVCacheMode.APPEND,
+            0,
+            cache_cond,
+            retained_k_observer=telemetry,
+            pass_name="append",
+            stream_name="cond",
+        ),
+        attn_meta=meta0,
+    )
+    module(
+        q_rot[:, :frame_tokens],
+        k[:, :frame_tokens],
+        v[:, :frame_tokens],
+        attn_ctx=_ctx(
+            KVCacheMode.APPEND,
+            0,
+            cache_uncond,
+            retained_k_observer=telemetry,
+            pass_name="append",
+            stream_name="uncond",
+        ),
+        attn_meta=meta0,
+    )
+
+    lo, hi = frame_tokens, 2 * frame_tokens
+    meta1 = AttnMaskSpec(mode="block_causal", pattern=pattern, q_block_offset=1)
+    module(
+        q_rot[:, lo:hi],
+        k[:, lo:hi],
+        v[:, lo:hi],
+        attn_ctx=_ctx(
+            KVCacheMode.READONLY,
+            1,
+            cache_cond,
+            retained_k_observer=telemetry,
+            pass_name="denoise0",
+            denoise_step=0,
+            stream_name="cond",
+        ),
+        attn_meta=meta1,
+    )
+
+    assert [(row["mode"], row["pass_name"], row["stream"]) for row in telemetry.records] == [
+        ("readonly", "denoise0", "cond"),
+        ("append", "append", "cond"),
+        ("append", "append", "uncond"),
+        ("readonly", "denoise0", "cond"),
+    ]
+    assert telemetry.records[0]["per_batch_head_retained_tokens"] == [
+        [frame_tokens] * N_HEADS
+    ]
+    assert telemetry.records[-1]["per_batch_head_retained_tokens"] == [
+        [2 * frame_tokens] * N_HEADS
+    ]
+    assert telemetry.records[-1]["dense_prefix_tokens"] == 2 * frame_tokens
 
 
 def test_block_zero_starts_a_fresh_clip():

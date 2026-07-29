@@ -109,6 +109,7 @@ class FrameAttentionObserver:
         method: str = "pooled",
         naive_chunk_frames: int = 4,
         store_device: str = "cpu",
+        verify_once: bool = False,
     ):
         if method not in {"pooled", "naive"}:
             raise ValueError(f"method must be 'pooled' or 'naive', got {method!r}")
@@ -121,6 +122,8 @@ class FrameAttentionObserver:
         self.method = method
         self.naive_chunk_frames = int(naive_chunk_frames)
         self.store_device = store_device
+        self.verify_once = bool(verify_once)
+        self.verification_stats: Optional[Dict[str, float]] = None
 
         self.full: Dict[int, torch.Tensor] = {
             layer: torch.zeros(self.num_heads, self.num_frames, self.num_frames, dtype=torch.float32, device=store_device)
@@ -129,6 +132,11 @@ class FrameAttentionObserver:
         # Which (layer, q_block) pairs have been written, so a second forward
         # pass over the same chunk cannot silently overwrite the first.
         self._seen: set = set()
+        self._seen_by_layer: Dict[int, set[int]] = {layer: set() for layer in self.layer_indices}
+        self._key_frame_ends: Dict[int, Dict[int, int]] = {layer: {} for layer in self.layer_indices}
+        self._query_frame_spans: Dict[int, Dict[int, List[int]]] = {
+            layer: {} for layer in self.layer_indices
+        }
         self.observed_blocks: List[int] = []
 
     def q_frame_start(self, q_block_idx: int) -> int:
@@ -142,8 +150,12 @@ class FrameAttentionObserver:
         if layer_idx not in self.full:
             return
         if (layer_idx, q_block_idx) in self._seen:
-            return
+            raise ValueError(f"duplicate attention observation for layer={layer_idx}, block={q_block_idx}")
         self._seen.add((layer_idx, q_block_idx))
+        self._seen_by_layer[layer_idx].add(int(q_block_idx))
+
+        if self.verify_once and self.verification_stats is None:
+            self.verification_stats = self.verify_against_naive(query, key)
 
         scale = 1.0 / math.sqrt(query.shape[-1])
         if self.method == "pooled":
@@ -161,8 +173,65 @@ class FrameAttentionObserver:
             )
 
         self.full[layer_idx][:, q_start:q_end, :k_end] = frame_attn.to(self.store_device)
+        self._key_frame_ends[layer_idx][int(q_block_idx)] = int(k_end)
+        self._query_frame_spans[layer_idx][int(q_block_idx)] = [
+            int(q_start),
+            int(q_end),
+        ]
         if q_block_idx not in self.observed_blocks:
             self.observed_blocks.append(q_block_idx)
+
+    def coverage(self, expected_blocks: int) -> Dict[str, object]:
+        """Return per-layer block/key-horizon coverage and fail on gaps."""
+        expected = set(range(int(expected_blocks)))
+        per_layer = {}
+        final_block = int(expected_blocks) - 1
+        for layer in self.layer_indices:
+            seen = self._seen_by_layer[layer]
+            key_ends = self._key_frame_ends[layer]
+            query_spans = self._query_frame_spans[layer]
+            missing = sorted(expected - seen)
+            extra = sorted(seen - expected)
+            invalid_horizons = []
+            for block in sorted(expected.intersection(seen)):
+                q_start, q_end = query_spans[block]
+                key_end = key_ends[block]
+                if key_end != q_end:
+                    invalid_horizons.append(
+                        {
+                            "block": block,
+                            "query_span": [q_start, q_end],
+                            "key_frame_end": key_end,
+                        }
+                    )
+            final_key_end = key_ends.get(final_block, 0)
+            tensor_shape = list(self.full[layer].shape)
+            complete = (
+                not missing
+                and not extra
+                and not invalid_horizons
+                and final_key_end == self.num_frames
+                and tensor_shape
+                == [self.num_heads, self.num_frames, self.num_frames]
+            )
+            per_layer[str(layer)] = {
+                "observed_blocks": sorted(seen),
+                "missing_blocks": missing,
+                "extra_blocks": extra,
+                "invalid_horizons": invalid_horizons,
+                "final_key_frame_end": final_key_end,
+                "tensor_shape": tensor_shape,
+                "complete": complete,
+            }
+        complete = all(row["complete"] for row in per_layer.values())
+        result = {
+            "expected_blocks": int(expected_blocks),
+            "layers": per_layer,
+            "complete": complete,
+        }
+        if not complete:
+            raise RuntimeError(f"incomplete attention coverage: {result}")
+        return result
 
     def block_sizes(self, num_blocks: Optional[int] = None) -> List[int]:
         """Frames per chunk, in rollout order (the analysis notebooks' `block_sizes`)."""

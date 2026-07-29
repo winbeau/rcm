@@ -157,7 +157,7 @@ class KVCache:
 
 @dataclass
 class AttnContext:
-    """Per-layer attention context carrying KV cache, RoPE, and observer."""
+    """Per-layer attention context carrying cache, observers, and pass metadata."""
 
     mode: KVCacheMode = KVCacheMode.DISABLED
     kv_cache: Optional[KVCache] = None
@@ -165,6 +165,10 @@ class AttnContext:
     layer_idx: int = 0
     q_block_idx: int = 0
     attn_observer: Optional[object] = None
+    retained_k_observer: Optional[object] = None
+    pass_name: str = ""
+    denoise_step: int = -1
+    stream_name: str = "cond"
     rope: Optional[RopeCache] = None
     fast_infer: bool = False
 
@@ -197,6 +201,10 @@ class CausalInferenceState:
     cached_t_indices: Optional[torch.Tensor] = None
     current_t_indices: Optional[torch.Tensor] = None
     attn_observer: Optional[object] = None
+    retained_k_observer: Optional[object] = None
+    pass_name: str = ""
+    denoise_step: int = -1
+    stream_name: str = "cond"
     rope: Optional[RopeCache] = None
     fast_infer: bool = False
 
@@ -220,6 +228,10 @@ class CausalInferenceState:
             layer_idx=layer_idx,
             q_block_idx=self.block_cursor,
             attn_observer=self.attn_observer,
+            retained_k_observer=self.retained_k_observer,
+            pass_name=self.pass_name,
+            denoise_step=self.denoise_step,
+            stream_name=self.stream_name,
             rope=self.rope,
             fast_infer=self.fast_infer,
         )

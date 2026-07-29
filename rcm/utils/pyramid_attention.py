@@ -437,6 +437,23 @@ class PyramidLocalAttention(nn.Module):
         k_flat, v_flat, cu_seqlens_k, max_seqlen_k, pos = cache.get_flat_kv_and_pos()
         m2 = torch.cuda.memory_allocated() if trace else 0
 
+        if attn_ctx.retained_k_observer is not None:
+            attn_ctx.retained_k_observer.record(
+                layer_idx=attn_ctx.layer_idx,
+                batch_size=b,
+                num_heads=h,
+                block_idx=block_idx,
+                mode=getattr(attn_ctx.mode, "value", str(attn_ctx.mode)),
+                pass_name=attn_ctx.pass_name,
+                stream=attn_ctx.stream_name,
+                denoise_step=attn_ctx.denoise_step,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_k=max_seqlen_k,
+                query_tokens=q.shape[1],
+                frame_seq_length=pattern.frame_tokens,
+                dense_prefix_tokens=pattern.blocks_to_tokens(block_idx + 1),
+            )
+
         k_flat = cache.apply_rope_to_flat_k(k_flat, pos, freqs=self._freq_table(k.device))
         m3 = torch.cuda.memory_allocated() if trace else 0
 

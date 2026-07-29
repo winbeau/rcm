@@ -19,7 +19,12 @@ Usage (distilled / few-step):
 """
 
 import argparse
+import hashlib
+import importlib.metadata
 import os
+import platform
+import sys
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -38,6 +43,15 @@ from rcm.tokenizers.wan2pt1 import Wan2pt1VAEInterface
 from rcm.utils.blockmask import AttnMaskSpec, BlockPattern
 from rcm.utils.kv_cache import CausalInferenceState, KVCacheMode
 from rcm.utils.frame_attention import FrameAttentionObserver
+from rcm.utils.attention_artifact import (
+    SCHEMA_VERSION,
+    git_revision,
+    git_worktree_state,
+    sha256_file,
+    validate_run_metadata,
+    write_json,
+)
+from rcm.utils.retained_k import RetainedKTelemetry
 
 # Pyramid Forcing's per-head cache is incompatible with the fast_infer path,
 # which writes through KVCache.write_transient into a dense contiguous buffer.
@@ -270,6 +284,7 @@ def causal_rollout_sampling(
     profile: dict | None = None,
     attn_observer: object | None = None,
     attn_capture_step: str = "append",
+    retained_k_observer: object | None = None,
 ) -> torch.Tensor:
     if context_from_last_step_start_chunk < 0:
         raise ValueError(f"context_from_last_step_start_chunk must be non-negative, got {context_from_last_step_start_chunk}")
@@ -317,7 +332,16 @@ def causal_rollout_sampling(
             # shares one key length, so only step 0 -- the noisiest query -- landed.
             observe_here = attn_observer if (attn_capture_step == "denoise0" and step_idx == 0) else None
             inf_cond = CausalInferenceState(
-                mode=kv_mode, kv_caches=kv_cond, pattern=bp, block_cursor=i, fast_infer=_FAST_INFER, attn_observer=observe_here
+                mode=kv_mode,
+                kv_caches=kv_cond,
+                pattern=bp,
+                block_cursor=i,
+                fast_infer=_FAST_INFER,
+                attn_observer=observe_here,
+                retained_k_observer=retained_k_observer,
+                pass_name="denoise0" if step_idx == 0 else "denoise",
+                denoise_step=step_idx,
+                stream_name="cond",
             )
 
             v_cond = net(
@@ -329,7 +353,17 @@ def causal_rollout_sampling(
             ).float()
 
             if use_cfg:
-                inf_uncond = CausalInferenceState(mode=kv_mode, kv_caches=kv_uncond, pattern=bp, block_cursor=i, fast_infer=_FAST_INFER)
+                inf_uncond = CausalInferenceState(
+                    mode=kv_mode,
+                    kv_caches=kv_uncond,
+                    pattern=bp,
+                    block_cursor=i,
+                    fast_infer=_FAST_INFER,
+                    retained_k_observer=retained_k_observer,
+                    pass_name="denoise0" if step_idx == 0 else "denoise",
+                    denoise_step=step_idx,
+                    stream_name="uncond",
+                )
                 v_uncond = net(
                     x_B_C_T_H_W=x.to(**TENSOR_KWARGS),
                     timesteps_B_T=t_cur_B_1,
@@ -354,12 +388,30 @@ def causal_rollout_sampling(
             # exactly one observation per chunk (the denoising forwards above
             # would fire once per step on progressively noisier inputs).
             inf_append_cond = CausalInferenceState(
-                mode=KVCacheMode.APPEND, kv_caches=kv_cond, pattern=bp, block_cursor=i, fast_infer=_FAST_INFER,
-                attn_observer=attn_observer if attn_capture_step == "append" else None
+                mode=KVCacheMode.APPEND,
+                kv_caches=kv_cond,
+                pattern=bp,
+                block_cursor=i,
+                fast_infer=_FAST_INFER,
+                attn_observer=attn_observer if attn_capture_step == "append" else None,
+                retained_k_observer=retained_k_observer,
+                pass_name="append",
+                denoise_step=-1,
+                stream_name="cond",
             )
             net(x_B_C_T_H_W=x.to(**TENSOR_KWARGS), timesteps_B_T=zero_t, **condition, inference_state=inf_append_cond, attn_meta=attn_meta)
             if use_cfg:
-                inf_append_uncond = CausalInferenceState(mode=KVCacheMode.APPEND, kv_caches=kv_uncond, pattern=bp, block_cursor=i, fast_infer=_FAST_INFER)
+                inf_append_uncond = CausalInferenceState(
+                    mode=KVCacheMode.APPEND,
+                    kv_caches=kv_uncond,
+                    pattern=bp,
+                    block_cursor=i,
+                    fast_infer=_FAST_INFER,
+                    retained_k_observer=retained_k_observer,
+                    pass_name="append",
+                    denoise_step=-1,
+                    stream_name="uncond",
+                )
                 net(x_B_C_T_H_W=x.to(**TENSOR_KWARGS), timesteps_B_T=zero_t, **uncondition, inference_state=inf_append_uncond, attn_meta=attn_meta)
 
         x_blocks.append(x)
@@ -392,6 +444,7 @@ def causal_i2v_rollout_sampling(
     context_from_last_step: bool = False,
     context_from_last_step_start_chunk: int = 0,
     profile: dict | None = None,
+    retained_k_observer: object | None = None,
 ) -> torch.Tensor:
     if context_from_last_step_start_chunk < 0:
         raise ValueError(f"context_from_last_step_start_chunk must be non-negative, got {context_from_last_step_start_chunk}")
@@ -434,10 +487,30 @@ def causal_i2v_rollout_sampling(
         image_context = (1 - prefill_t) * image_context + prefill_t * image_noise.to(torch.float64)
     prefill_t_B_1 = (prefill_t * ones_B_1 * RECTIFIED_FLOW_T_SCALING).to(**TENSOR_KWARGS)
 
-    inf_cond = CausalInferenceState(mode=KVCacheMode.APPEND, kv_caches=kv_cond, pattern=bp, block_cursor=0, fast_infer=_FAST_INFER)
+    inf_cond = CausalInferenceState(
+        mode=KVCacheMode.APPEND,
+        kv_caches=kv_cond,
+        pattern=bp,
+        block_cursor=0,
+        fast_infer=_FAST_INFER,
+        retained_k_observer=retained_k_observer,
+        pass_name="append",
+        denoise_step=-1,
+        stream_name="cond",
+    )
     net(x_B_C_T_H_W=image_context.to(**TENSOR_KWARGS), timesteps_B_T=prefill_t_B_1, **condition, inference_state=inf_cond, attn_meta=attn_meta_0)
     if use_cfg:
-        inf_uncond = CausalInferenceState(mode=KVCacheMode.APPEND, kv_caches=kv_uncond, pattern=bp, block_cursor=0, fast_infer=_FAST_INFER)
+        inf_uncond = CausalInferenceState(
+            mode=KVCacheMode.APPEND,
+            kv_caches=kv_uncond,
+            pattern=bp,
+            block_cursor=0,
+            fast_infer=_FAST_INFER,
+            retained_k_observer=retained_k_observer,
+            pass_name="append",
+            denoise_step=-1,
+            stream_name="uncond",
+        )
         net(
             x_B_C_T_H_W=image_context.to(**TENSOR_KWARGS),
             timesteps_B_T=prefill_t_B_1,
@@ -463,7 +536,17 @@ def causal_i2v_rollout_sampling(
             t_cur_B_1 = (t_cur * ones_B_1 * RECTIFIED_FLOW_T_SCALING).to(**TENSOR_KWARGS)
             is_last = step_idx == num_steps - 1
             kv_mode = KVCacheMode.APPEND if (use_last_step_context and is_last) else KVCacheMode.READONLY
-            inf_cond = CausalInferenceState(mode=kv_mode, kv_caches=kv_cond, pattern=bp, block_cursor=i, fast_infer=_FAST_INFER)
+            inf_cond = CausalInferenceState(
+                mode=kv_mode,
+                kv_caches=kv_cond,
+                pattern=bp,
+                block_cursor=i,
+                fast_infer=_FAST_INFER,
+                retained_k_observer=retained_k_observer,
+                pass_name="denoise0" if step_idx == 0 else "denoise",
+                denoise_step=step_idx,
+                stream_name="cond",
+            )
 
             v_cond = net(
                 x_B_C_T_H_W=x.to(**TENSOR_KWARGS),
@@ -474,7 +557,17 @@ def causal_i2v_rollout_sampling(
             ).float()
 
             if use_cfg:
-                inf_uncond = CausalInferenceState(mode=kv_mode, kv_caches=kv_uncond, pattern=bp, block_cursor=i, fast_infer=_FAST_INFER)
+                inf_uncond = CausalInferenceState(
+                    mode=kv_mode,
+                    kv_caches=kv_uncond,
+                    pattern=bp,
+                    block_cursor=i,
+                    fast_infer=_FAST_INFER,
+                    retained_k_observer=retained_k_observer,
+                    pass_name="denoise0" if step_idx == 0 else "denoise",
+                    denoise_step=step_idx,
+                    stream_name="uncond",
+                )
                 v_uncond = net(
                     x_B_C_T_H_W=x.to(**TENSOR_KWARGS),
                     timesteps_B_T=t_cur_B_1,
@@ -494,10 +587,30 @@ def causal_i2v_rollout_sampling(
 
         if not use_last_step_context:
             zero_t = torch.zeros(B, 1, **TENSOR_KWARGS)
-            inf_append_cond = CausalInferenceState(mode=KVCacheMode.APPEND, kv_caches=kv_cond, pattern=bp, block_cursor=i, fast_infer=_FAST_INFER)
+            inf_append_cond = CausalInferenceState(
+                mode=KVCacheMode.APPEND,
+                kv_caches=kv_cond,
+                pattern=bp,
+                block_cursor=i,
+                fast_infer=_FAST_INFER,
+                retained_k_observer=retained_k_observer,
+                pass_name="append",
+                denoise_step=-1,
+                stream_name="cond",
+            )
             net(x_B_C_T_H_W=x.to(**TENSOR_KWARGS), timesteps_B_T=zero_t, **condition, inference_state=inf_append_cond, attn_meta=attn_meta)
             if use_cfg:
-                inf_append_uncond = CausalInferenceState(mode=KVCacheMode.APPEND, kv_caches=kv_uncond, pattern=bp, block_cursor=i, fast_infer=_FAST_INFER)
+                inf_append_uncond = CausalInferenceState(
+                    mode=KVCacheMode.APPEND,
+                    kv_caches=kv_uncond,
+                    pattern=bp,
+                    block_cursor=i,
+                    fast_infer=_FAST_INFER,
+                    retained_k_observer=retained_k_observer,
+                    pass_name="append",
+                    denoise_step=-1,
+                    stream_name="uncond",
+                )
                 net(x_B_C_T_H_W=x.to(**TENSOR_KWARGS), timesteps_B_T=zero_t, **uncondition, inference_state=inf_append_uncond, attn_meta=attn_meta)
 
         x_blocks.append(x)
@@ -535,6 +648,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--first_chunk_t", type=int, default=1, help="Number of frames in the first chunk")
     parser.add_argument("--chunk_t", type=int, default=1, help="Number of frames in subsequent chunks")
     parser.add_argument("--dit_path", type=str, required=True, help="Path to the DiT checkpoint")
+    parser.add_argument(
+        "--dit_sha256",
+        type=str,
+        default=os.environ.get("RCM_DIT_SHA256", ""),
+        help="Precomputed checkpoint SHA-256 for capture metadata; avoids rehashing a large checkpoint per run",
+    )
     parser.add_argument("--vae_path", type=str, default="assets/checkpoints/Wan2.1_VAE.pth")
     parser.add_argument("--text_encoder_path", type=str, default="assets/checkpoints/models_t5_umt5-xxl-enc-bf16.pth")
     parser.add_argument("--num_frames", type=int, default=81)
@@ -555,6 +674,12 @@ def parse_arguments() -> argparse.Namespace:
         help="Path to a 30x12 Anchor/Wave/Veil label CSV. Enables the head-aware "
         "KV cache (Pyramid Forcing) and turns off fast_infer, which is "
         "incompatible with a per-head ragged cache.",
+    )
+    parser.add_argument(
+        "--pyramid_retained_k_output",
+        type=str,
+        default="",
+        help="Optional JSONL path for actual per-head retained-K telemetry during PyramidKV inference",
     )
     parser.add_argument("--pyramid_recent_frames", type=int, default=4)
     parser.add_argument("--pyramid_osc_sink_frames", type=int, default=1)
@@ -646,6 +771,41 @@ def load_dit_weights(net, dit_path: str):
 
 if __name__ == "__main__":
     args = parse_arguments()
+
+    if args.extract_attn_layers and args.pyramid_kv_labels:
+        raise ValueError("--extract_attn_layers requires dense full-horizon attention; do not combine it with --pyramid_kv_labels")
+    if args.attn_verify and not args.extract_attn_layers:
+        raise ValueError("--attn_verify requires --extract_attn_layers")
+    if args.extract_attn_layers and args.num_samples != 1:
+        raise ValueError("attention extraction requires --num_samples 1 so samples are never averaged")
+    if args.extract_attn_layers and (args.warmup_iters != 0 or args.num_runs != 1):
+        raise ValueError("attention extraction requires --warmup_iters 0 --num_runs 1")
+    if args.pyramid_retained_k_output and not args.pyramid_kv_labels:
+        raise ValueError("--pyramid_retained_k_output requires --pyramid_kv_labels")
+    if args.pyramid_retained_k_output and (
+        args.warmup_iters != 0 or args.num_runs != 1
+    ):
+        raise ValueError(
+            "retained-K telemetry is per run; use --warmup_iters 0 --num_runs 1"
+        )
+
+    attention_checkpoint_sha256 = None
+    if args.extract_attn_layers:
+        if args.dit_sha256:
+            attention_checkpoint_sha256 = args.dit_sha256.strip().lower()
+        elif os.path.isfile(args.dit_path):
+            log.info("Hashing DiT checkpoint for attention artifact provenance...")
+            attention_checkpoint_sha256 = sha256_file(args.dit_path)
+        else:
+            raise ValueError(
+                "attention extraction from a checkpoint directory requires "
+                "--dit_sha256 or RCM_DIT_SHA256"
+            )
+        if len(attention_checkpoint_sha256) != 64 or any(
+            char not in "0123456789abcdef"
+            for char in attention_checkpoint_sha256
+        ):
+            raise ValueError("--dit_sha256 must be a 64-character hexadecimal digest")
 
     # --- Load model ---
     with init_weights_on_device():
@@ -784,6 +944,8 @@ if __name__ == "__main__":
     # --- Sample ---
     net.cuda()
 
+    retained_k_observer = RetainedKTelemetry() if args.pyramid_retained_k_output else None
+
     # --- Frame-level attention observer ---
     attn_observer = None
     if args.extract_attn_layers:
@@ -813,11 +975,29 @@ if __name__ == "__main__":
             first_chunk_frames=args.first_chunk_t,
             chunk_frames=args.chunk_t,
             method=args.attn_method,
+            verify_once=args.attn_verify,
         )
         log.info(
             f"Attention extraction: layers={layer_indices} heads={net.num_heads} "
             f"frames={T_latent} frame_tokens={frame_tokens_ext} method={args.attn_method}"
         )
+        if args.attn_layout == "runs":
+            attn_dir = Path(args.attn_output_dir) / f"run_{args.attn_run_index:03d}"
+        else:
+            attn_dir = Path(args.attn_output_dir)
+        attn_dir.mkdir(parents=True, exist_ok=True)
+        tag = "" if args.attn_layout == "runs" else (f"_{args.attn_tag}" if args.attn_tag else "")
+        output_paths = {
+            layer_index: attn_dir / f"layer{layer_index}{tag}.pt"
+            for layer_index in sorted(layer_indices)
+        }
+        manifest_path = attn_dir / "run.json"
+        existing = [path for path in [*output_paths.values(), manifest_path] if path.exists()]
+        if existing:
+            raise FileExistsError(
+                "refusing to overwrite existing attention artifacts: "
+                + ", ".join(str(path) for path in existing)
+            )
 
     def _run_sampling(profile: dict | None = None):
         g = torch.Generator(device=TENSOR_KWARGS["device"])
@@ -840,6 +1020,7 @@ if __name__ == "__main__":
                 context_from_last_step=args.context_from_last_step,
                 context_from_last_step_start_chunk=args.context_from_last_step_start_chunk,
                 profile=profile,
+                retained_k_observer=retained_k_observer,
             )
         return causal_rollout_sampling(
             net,
@@ -859,6 +1040,7 @@ if __name__ == "__main__":
             profile=profile,
             attn_observer=attn_observer,
             attn_capture_step=args.attn_capture_step,
+            retained_k_observer=retained_k_observer,
         )
 
     # --- Warmup ---
@@ -947,38 +1129,54 @@ if __name__ == "__main__":
     save_image_or_video(rearrange(to_show, "n b c t h w -> c t (n h) (b w)"), args.save_path, fps=16)
     log.success(f"Saved to {args.save_path}")
 
+    if retained_k_observer is not None:
+        if not retained_k_observer.records:
+            raise RuntimeError(
+                "PyramidKV retained-K telemetry was requested but no records were captured"
+            )
+        retained_k_observer.write_jsonl(args.pyramid_retained_k_output)
+        log.success(
+            f"Saved {len(retained_k_observer.records)} retained-K records to "
+            f"{args.pyramid_retained_k_output}"
+        )
+
     # --- Persist frame-level attention ---
     if attn_observer is not None:
-        if args.attn_layout == "runs":
-            attn_dir = os.path.join(args.attn_output_dir, f"run_{args.attn_run_index:03d}")
-        else:
-            attn_dir = args.attn_output_dir
-        os.makedirs(attn_dir, exist_ok=True)
+        if (T_latent - args.first_chunk_t) % args.chunk_t != 0:
+            raise RuntimeError(
+                "latent-frame geometry does not divide exactly into the configured chunks"
+            )
         expected_blocks = 1 + (T_latent - args.first_chunk_t) // args.chunk_t
         if not attn_observer.observed_blocks:
             raise RuntimeError(
-                f"the observer never fired with --attn_capture_step {args.attn_capture_step}; refusing to write an all-zero matrix"
+                f"the observer never fired with --attn_capture_step {args.attn_capture_step}; "
+                "refusing to write an all-zero matrix"
             )
-        if len(attn_observer.observed_blocks) != expected_blocks:
-            log.warning(f"observed {len(attn_observer.observed_blocks)}/{expected_blocks} chunks; the matrix has unfilled rows")
+        coverage = attn_observer.coverage(expected_blocks)
         if args.attn_layout == "runs" and T_latent < 69:
             log.warning(
-                f"--attn_layout runs targets the spectral analysis, which slices last_block_frame_attention[0:69]; "
-                f"this run only has {T_latent} latent frames. Use --num_frames 285 (72 latent frames) or more."
+                "--attn_layout runs targets the spectral analysis, which slices "
+                "last_block_frame_attention[0:69]; this plumbing run is too short "
+                "for classification"
             )
         block_sizes = attn_observer.block_sizes(expected_blocks)
         last_block_q_start = sum(block_sizes[:-1])
         last_block_q_frames = list(range(last_block_q_start, T_latent))
+        capture_protocol = f"rcm{T_latent}-{args.attn_capture_step}-v1"
+        capture_description = (
+            "kv-append (t=0, clean query x clean key), once per chunk"
+            if args.attn_capture_step == "append"
+            else "denoise step 0 (noisy query x clean key), once per chunk"
+        )
         # The spectral consumer globs a bare layer<N>.pt, so 'runs' drops the tag.
-        tag = "" if args.attn_layout == "runs" else (f"_{args.attn_tag}" if args.attn_tag else "")
-
-        for layer_index in sorted(attn_observer.full):
+        artifacts = []
+        for layer_index, out_path in output_paths.items():
             full_frame_attn = attn_observer.full[layer_index]
             last_block_frame_attn = full_frame_attn[:, last_block_q_start:T_latent, :].mean(dim=1)
-            out_path = os.path.join(attn_dir, f"layer{layer_index}{tag}.pt")
             torch.save(
                 {
                     # --- schema consumed by the analysis notebooks ---
+                    "schema_version": SCHEMA_VERSION,
                     "layer_index": layer_index,
                     "full_frame_attention": full_frame_attn.to(torch.float16),
                     "last_block_frame_attention": last_block_frame_attn.to(torch.float16),
@@ -994,22 +1192,99 @@ if __name__ == "__main__":
                     "last_block_query_frames": last_block_q_frames,
                     "extraction_method": f"rcm-observer-{args.attn_method}",
                     "chunk_frames": args.chunk_t,
-                    # --- rcm-specific provenance ---
+                    # --- rCM-specific provenance ---
+                    "capture_protocol": capture_protocol,
                     "model": f"Causal-rCM Wan2.1 T2V {args.model_size}",
                     "dit_path": args.dit_path,
+                    "dit_sha256": attention_checkpoint_sha256,
                     "first_chunk_t": args.first_chunk_t,
                     "chunk_t": args.chunk_t,
                     "num_steps": args.num_steps,
                     "seed": args.seed,
+                    "sample_count": args.num_samples,
                     "resolution": args.resolution,
                     "aspect_ratio": args.aspect_ratio,
-                    "capture_pass": (
-                        "kv-append (t=0, clean query x clean key), once per chunk"
-                        if args.attn_capture_step == "append"
-                        else "denoise step 0 (noisy query x clean key), once per chunk -- AdaHead-comparable"
-                    ),
+                    "capture_pass": capture_description,
                     "attn_capture_step": args.attn_capture_step,
+                    "coverage": coverage["layers"][str(layer_index)],
                 },
                 out_path,
             )
-        log.success(f"Saved {len(attn_observer.full)} attention artifact(s) to {attn_dir}/")
+            artifacts.append(
+                {
+                    "layer_index": layer_index,
+                    "path": out_path.name,
+                    "sha256": sha256_file(out_path),
+                    "shape": [attn_observer.num_heads, T_latent, T_latent],
+                    "dtype": "float16",
+                }
+            )
+
+        repo_root = Path(__file__).resolve().parents[2]
+        try:
+            flash_attn_version = importlib.metadata.version("flash-attn")
+        except importlib.metadata.PackageNotFoundError:
+            flash_attn_version = None
+        run_metadata = {
+            "schema_version": SCHEMA_VERSION,
+            "capture_protocol": capture_protocol,
+            "model": "Causal-rCM Wan2.1 T2V",
+            "model_size": args.model_size,
+            "num_layers": len(net.blocks),
+            "num_heads": net.num_heads,
+            "layer_indices": sorted(attn_observer.full),
+            "prompt": args.prompt,
+            "prompt_sha256": hashlib.sha256(args.prompt.encode("utf-8")).hexdigest(),
+            "seed": args.seed,
+            "sample_count": args.num_samples,
+            "pixel_geometry": {"width": w, "height": h},
+            "latent_geometry": {
+                "frames": T_latent,
+                "height": state_shape[2],
+                "width": state_shape[3],
+                "patchified_height": state_shape[2] // net.patch_size[1],
+                "patchified_width": state_shape[3] // net.patch_size[2],
+            },
+            "frame_seq_length": attn_observer.frame_tokens,
+            "num_frames_latent": T_latent,
+            "first_chunk_frames": args.first_chunk_t,
+            "chunk_frames": args.chunk_t,
+            "capture_pass": args.attn_capture_step,
+            "capture_description": capture_description,
+            "full_horizon": True,
+            "dtype": {
+                "model": str(TENSOR_KWARGS["dtype"]).removeprefix("torch."),
+                "artifact": "float16",
+            },
+            "command_argv": [sys.executable, *sys.argv],
+            "checkpoint": {
+                "path": str(Path(args.dit_path).resolve()),
+                "sha256": attention_checkpoint_sha256,
+            },
+            "repository": {
+                "path": str(repo_root),
+                "revision": git_revision(repo_root),
+                "worktree": git_worktree_state(repo_root),
+            },
+            "runtime": {
+                "python": platform.python_version(),
+                "python_executable": sys.executable,
+                "platform": platform.platform(),
+                "torch": torch.__version__,
+                "cuda_runtime": torch.version.cuda,
+                "cudnn": torch.backends.cudnn.version(),
+                "flash_attn": flash_attn_version,
+                "gpu": torch.cuda.get_device_name(torch.cuda.current_device()),
+            },
+            "verification": {
+                "enabled": args.attn_verify,
+                "stats": attn_observer.verification_stats,
+            },
+            "coverage": coverage,
+            "artifacts": artifacts,
+        }
+        validate_run_metadata(run_metadata)
+        write_json(manifest_path, run_metadata)
+        log.success(
+            f"Saved {len(artifacts)} attention artifact(s) and {manifest_path}"
+        )
